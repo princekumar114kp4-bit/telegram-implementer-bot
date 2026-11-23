@@ -4,6 +4,10 @@ The owner sends a bot .py file. The bot shows what the file already has (web ser
 and 3 buttons. A tap adds a web server and/or a keep-alive pinger to a NEW copy of that file and
 sends the copy back as a document. The original file is never changed.
 
+Old web server or pinger code written by someone else is removed from the copy (only the exact
+statements, found with ast) and our version is added in its place. Only code this bot added
+earlier (the hyv-injected marker blocks) counts as "already there".
+
 Buttons (owner only): "Status dekho" shows what the last file has; "Pichli file lo" sends the last
 updated file again. Typed /status and /last still work (quietly, no hint is shown).
 
@@ -64,8 +68,9 @@ WELCOME = ("👋 Namaste! Main Bot Implementer hoon.\n"
            "📊 Status dekho: file me kya pehle se hai\n"
            "🔁 Pichli file lo: pichli updated file dobara")
 STATUS_TEXT = {
-    "sure": "✅ pehle se hai",
-    "unsure": "❔ shayad hai (pakka nahi)",
+    "ours": "✅ pehle se hai (bot ka apna code)",
+    "old": "🔁 purana code hai, hata kar naya lagega",
+    "stuck": "❔ purana code hai, par poora hata nahi sakta",
     "none": "➕ nahi hai, add ho sakta hai",
 }
 
@@ -147,74 +152,306 @@ except Exception:
 '''
 
 # ---- Detection ------------------------------------------------------------------------
-# Conservative: any match counts as "already there". "sure" means a clear sign; "unsure"
-# means a weak sign, and the bot still does not add the code and says so.
+# Only OUR OWN code counts as "already there": the hyv-injected marker blocks. Any other web
+# server or pinger, written by someone else, is "old code". Old code is removed (only the exact
+# statements, found with ast; every other line is kept) and our version is added in its place.
+# If the old code cannot be removed exactly, the file is not changed and the member is told.
 
-WEB_SURE = [
-    r"hyv-injected:web",                                        # our own block, added before
-    r"^\s*(?:from|import)\s+(?:flask|fastapi|bottle|aiohttp|tornado|sanic|quart|waitress"
-    r"|gunicorn|uvicorn|http\.server|socketserver)\b",           # web framework / http server import
-    r"\bFlask\s*\(",                                             # Flask app object
-    r"HTTPServer\b|\bserve_forever\s*\(",                        # stdlib http server (also ThreadingHTTPServer)
-    r"\bstart_web\s*\(",                                         # keep_alive.start_web() style
-    r"\.run\([^)]*0\.0\.0\.0",                                   # app.run(host="0.0.0.0", ...)
-]
-WEB_UNSURE = [
-    r"0\.0\.0\.0",                                               # bind-all address somewhere
-    r"(?:environ(?:\.get)?|getenv)\s*\(\s*[\"']PORT[\"']",       # reads PORT from the environment
-]
-PINGER_SURE = [
-    r"hyv-injected:pinger",                                      # our own block, added before
-    r"RENDER_EXTERNAL_URL",                                      # Render's own URL variable
-    r"PING_URLS|PING_MINUTES",
-    r"keep[_\- ]?alive",
-    r"self[_\- ]?ping",
-    r"\bping_(?:loop|thread|self|url|urls|every)\b",
-]
-PINGER_UNSURE = [
-    r"\bpinger\b",                                               # the word alone, e.g. in a comment
-    r"\bping\b",                                                 # e.g. a /ping command, or a word in text
-]
-PERIODIC_THREAD = r"\bThread\s*\(|\.Thread\s*\("
-PERIODIC_SLEEP = r"\bsleep\s*\("
-PERIODIC_HTTP = r"\brequests\.(?:get|head|post)\s*\(|\burlopen\s*\(|\bhttpx\.\w+\s*\(|\baiohttp\b"
+WEB_MODULES = frozenset({"flask", "fastapi", "bottle", "aiohttp", "tornado", "sanic", "quart",
+                         "waitress", "gunicorn", "uvicorn", "socketserver", "http.server"})
+WEB_IDS = frozenset({"Flask", "HTTPServer", "ThreadingHTTPServer", "BaseHTTPRequestHandler",
+                     "serve_forever"})
+WEB_NAME = re.compile(r"run_web\w*|start_web\w*|serve_web\w*|run_flask\w*|run_server|start_server"
+                      r"|web_server|run_web_server")
+PING_ENV = frozenset({"RENDER_EXTERNAL_URL", "PING_URLS", "PING_MINUTES"})
+PING_NAME = re.compile(r"(?:start_|run_)?(?:keep_?alive|self_?ping|pinger|ping_loop|ping_thread"
+                       r"|ping_self|ping_url|ping_urls|ping_every|ping_forever|ping_render)\w*")
+# This bot's own helper functions outside the marker blocks. They are never old code, so a copy of
+# this file (uploaded back to the bot) keeps them.
+NOT_OLD = frozenset({"web_server_status", "pinger_status", "status_block"})
+MARKER = {"web": "# >>> hyv-injected:web", "ping": "# >>> hyv-injected:pinger"}
+END_MARKER = {"web": "# <<< hyv-injected:web", "ping": "# <<< hyv-injected:pinger"}
+KIND_NAME = {"web": "Web server", "ping": "Pinger"}
+SYNTAX_MSG = "Is file me syntax error hai. Pehle use theek karke dobara bhejo."
+BROKEN_MSG = "File me bot ka apna code adhura hai, isliye file nahi badli aur naya code nahi joda."
 
 
-def _any(patterns, source, flags):
-    return any(re.search(p, source, flags) for p in patterns)
+class _Unclear(Exception):
+    """Raised inside the analysis when the old code cannot be removed exactly."""
+
+
+class _Result:
+    def __init__(self):
+        self.found = set()   # kinds ("web", "ping") that have old code
+        self.error = None    # one plain sentence when the old code cannot be removed exactly
+        self.text = None     # the file with the old statements removed (None when nothing is removed)
+        self.spans = []      # removed line ranges (1-based, inclusive)
+
+
+def _cannot(kinds):
+    names = " aur ".join(KIND_NAME[k].lower() for k in ("web", "ping") if k in kinds)
+    return (f"Purana {names} code mila, par use poori tarah hata nahi paya, isliye file nahi badli "
+            "aur naya code nahi joda; us code ko khud hata kar file dobara bhejo.")
+
+
+def _has_ours(source, kind):
+    """True when this bot's own marker block for the kind is in the file."""
+    return any(line.strip().startswith(MARKER[kind]) for line in source.split("\n"))
+
+
+def _our_spans(lines):
+    """(first, last) line numbers (1-based) of every marker block this bot added. Raises _Unclear
+    when a start marker has no end marker (the block was cut)."""
+    spans = []
+    for kind in ("web", "ping"):
+        for i, line in enumerate(lines):
+            if line.strip().startswith(MARKER[kind]):
+                for j in range(i + 1, len(lines)):
+                    if lines[j].strip().startswith(END_MARKER[kind]):
+                        spans.append((i + 1, j + 1))
+                        break
+                else:
+                    raise _Unclear(BROKEN_MSG)
+    return spans
+
+
+def _bound_names(node):
+    """Names a piece of code binds: assigned names, def and class names, import names."""
+    names = set()
+    for x in ast.walk(node):
+        if isinstance(x, ast.Name) and isinstance(x.ctx, (ast.Store, ast.Del)):
+            names.add(x.id)
+        elif isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(x.name)
+        elif isinstance(x, (ast.Import, ast.ImportFrom)):
+            for a in x.names:
+                names.add(a.asname or a.name.split(".")[0])
+    return names
+
+
+def _loads_any(node, names):
+    return any(isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load) and x.id in names
+               for x in ast.walk(node))
+
+
+def _const_in(node, values):
+    return isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in values
+
+
+def _ident_kinds(s):
+    out = set()
+    if s in WEB_IDS or WEB_NAME.fullmatch(s):
+        out.add("web")
+    if s in PING_ENV or PING_NAME.fullmatch(s):
+        out.add("ping")
+    return out
+
+
+def _is_route(dec):
+    """@app.route(...) or @app.route: a web route."""
+    if isinstance(dec, ast.Call):
+        dec = dec.func
+    return isinstance(dec, ast.Attribute) and dec.attr == "route"
+
+
+def _kinds_in(node):
+    """Kinds whose signs show up anywhere inside a simple statement (no nested statements)."""
+    kinds = set()
+    for x in ast.walk(node):
+        if isinstance(x, (ast.Import, ast.ImportFrom)):
+            names = [a.name for a in x.names] + [a.asname for a in x.names if a.asname]
+            if isinstance(x, ast.ImportFrom) and x.module:
+                names.append(x.module)
+            for s in names:
+                root = s.split(".")[0]
+                if s in WEB_MODULES or root in WEB_MODULES:
+                    kinds.add("web")
+                if PING_NAME.fullmatch(root) or PING_NAME.fullmatch(s):
+                    kinds.add("ping")
+        elif isinstance(x, ast.Name):
+            kinds |= _ident_kinds(x.id)
+        elif isinstance(x, ast.Attribute):
+            kinds |= _ident_kinds(x.attr)
+        elif isinstance(x, ast.Call):
+            f = x.func
+            fname = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+            if fname == "run" and any(_const_in(c, ("0.0.0.0",)) for c in ast.walk(x)):
+                kinds.add("web")                      # app.run(host="0.0.0.0", ...)
+            if fname in ("get", "getenv") and x.args and _const_in(x.args[0], PING_ENV):
+                kinds.add("ping")                     # os.environ.get("RENDER_EXTERNAL_URL")
+        elif isinstance(x, ast.Subscript) and _const_in(x.slice, PING_ENV):
+            kinds.add("ping")                         # os.environ["RENDER_EXTERNAL_URL"]
+    return kinds
+
+
+def _is_glue(n, names):
+    """A simple statement that only starts or calls a removed piece: keep_alive(), t.start(),
+    threading.Thread(target=removed_fn). Any other statement is left alone."""
+    if not isinstance(n, (ast.Expr, ast.Assign, ast.AnnAssign, ast.AugAssign)) or n.value is None:
+        return False
+    v = n.value
+    if isinstance(v, ast.Call):
+        if isinstance(v.func, ast.Name) and v.func.id in names:
+            return True
+        if isinstance(v.func, ast.Attribute) and v.func.attr in ("start", "join", "cancel") \
+                and _loads_any(v.func.value, names):
+            return True
+    for x in ast.walk(v):
+        if isinstance(x, ast.Call) and any(k.arg == "target" and _loads_any(k.value, names)
+                                           for k in x.keywords):
+            return True
+    return False
+
+
+def _analyze(source, kinds):
+    """Finds the old web server / pinger code of the given kinds. Changes nothing.
+
+    Returns a _Result. Raises SyntaxError when the file does not parse."""
+    kinds = set(kinds)
+    tree = ast.parse(source)
+    lines = source.split("\n")
+    res = _Result()
+    try:
+        spans = _our_spans(lines)
+    except _Unclear as e:
+        res.error = str(e)
+        return res
+
+    def in_ours(n):
+        return any(a <= n.lineno <= b for a, b in spans)
+
+    parent = {}
+    for p in ast.walk(tree):
+        for c in ast.iter_child_nodes(p):
+            parent[c] = p
+
+    def ancestors(n):
+        while n in parent:
+            n = parent[n]
+            yield n
+
+    stmts = sorted((n for n in ast.walk(tree) if isinstance(n, ast.stmt) and not in_ours(n)),
+                   key=lambda n: (n.lineno, n.col_offset))
+
+    # Names our own blocks define. Code that uses them (our start calls) is ours, not old.
+    ours_names = set()
+    for n in tree.body:
+        if in_ours(n):
+            ours_names |= _bound_names(n)
+
+    def loads_ours(n):
+        return any(isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load) and x.id in ours_names
+                   for x in ast.walk(n))
+
+    def own_kinds(n):
+        """Kinds a statement is by itself. A def or class is judged by its name and decorators
+        only, so a bot's main() that starts an old thread is not removed as a whole."""
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            k = set()
+            if n.name in NOT_OLD:
+                return k
+            if WEB_NAME.fullmatch(n.name):
+                k.add("web")
+            if PING_NAME.fullmatch(n.name):
+                k.add("ping")
+            if any(_is_route(d) for d in n.decorator_list):
+                k.add("web")
+            return k
+        # A return is never cut: removing it would change what a function gives back.
+        if isinstance(n, (ast.Expr, ast.Assign, ast.AugAssign, ast.AnnAssign,
+                          ast.Import, ast.ImportFrom)):
+            return set() if loads_ours(n) else _kinds_in(n)
+        return set()
+
+    removed = set()
+    for n in stmts:
+        k = own_kinds(n)
+        if not (k & kinds):
+            continue
+        if k - kinds:
+            res.error = _cannot(k)  # one statement carries both kinds: cannot split it exactly
+            return res
+        removed.add(n)
+        res.found |= k
+    if not res.found:
+        return res
+
+    def live(n):
+        return not any(a in removed for a in ancestors(n))
+
+    # Closure: a def whose whole body was removed goes too; simple statements that only start or
+    # call a removed piece go too. Everything else stays and is checked below.
+    while True:
+        names = set()
+        for n in removed:
+            names |= _bound_names(n)
+        changed = False
+        for n in stmts:
+            if n in removed or not live(n):
+                continue
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.body \
+                    and all(b in removed for b in n.body):
+                removed.add(n)
+                changed = True
+            elif _is_glue(n, names):
+                removed.add(n)
+                changed = True
+        if not changed:
+            break
+
+    final = [n for n in removed if not any(a in removed for a in ancestors(n))]
+    spans_out = []
+    for n in final:
+        first = min([n.lineno] + [d.lineno for d in getattr(n, "decorator_list", [])])
+        spans_out.append((first, n.end_lineno))
+    anc = set()
+    for n in final:
+        anc.update(ancestors(n))
+    for s in stmts:
+        if s in removed or not live(s) or s in anc:
+            continue
+        for a, b in spans_out:
+            if s.lineno <= b and a <= s.end_lineno:  # a kept statement shares a line: not exact
+                res.error = _cannot(res.found)
+                return res
+
+    keep = [ln for i, ln in enumerate(lines, 1) if not any(a <= i <= b for a, b in spans_out)]
+    new_text = "\n".join(keep)
+    try:
+        new_tree = ast.parse(new_text)
+    except SyntaxError:
+        res.error = _cannot(res.found)
+        return res
+    names_removed = set()
+    for n in final:
+        names_removed |= _bound_names(n)
+    loads = {x.id for x in ast.walk(new_tree) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load)}
+    if (loads & names_removed) - _bound_names(new_tree):  # kept code still uses a removed name
+        res.error = _cannot(res.found)
+        return res
+    res.text = new_text
+    res.spans = sorted(spans_out)
+    return res
+
+
+def _kind_state(source, kind):
+    """"ours", "old" (can be removed exactly), "stuck" (old code, cannot be removed) or "none"."""
+    if _has_ours(source, kind):
+        return "ours"
+    res = _analyze(source, {kind})
+    if res.error:
+        return "stuck"
+    return "old" if res.found else "none"
 
 
 def web_server_status(source):
-    """Does the file already have a web server? Returns "sure", "unsure" or "none".
-
-    Looks for: our own marker; imports of flask, fastapi, bottle, aiohttp, tornado, sanic, quart,
-    waitress, gunicorn, uvicorn, http.server, socketserver; Flask( ; HTTPServer / ThreadingHTTPServer /
-    serve_forever(; start_web(; app.run(... 0.0.0.0 ...).
-    "unsure" when only these show up: the text 0.0.0.0, or a PORT read from the environment.
-    """
-    if _any(WEB_SURE, source, re.M):
-        return "sure"
-    if _any(WEB_UNSURE, source, re.M):
-        return "unsure"
-    return "none"
+    """Web server state of a file: "ours", "old", "stuck" or "none"."""
+    return _kind_state(source, "web")
 
 
 def pinger_status(source):
-    """Does the file already have a keep-alive pinger? Returns "sure", "unsure" or "none".
-
-    Looks for: our own marker; RENDER_EXTERNAL_URL; PING_URLS / PING_MINUTES; keep_alive /
-    keep-alive / keepalive; self-ping names; ping_loop / ping_thread / ping_url names.
-    "unsure" when only these show up: the word pinger or ping on its own, or a background thread that
-    sleeps and makes a web request (a periodic request job).
-    """
-    if _any(PINGER_SURE, source, re.I | re.M):
-        return "sure"
-    if _any(PINGER_UNSURE, source, re.I | re.M):
-        return "unsure"
-    if (re.search(PERIODIC_THREAD, source) and re.search(PERIODIC_SLEEP, source)
-            and re.search(PERIODIC_HTTP, source)):
-        return "unsure"
-    return "none"
+    """Pinger state of a file: "ours", "old", "stuck" or "none"."""
+    return _kind_state(source, "ping")
 
 
 # ---- Injection ------------------------------------------------------------------------
@@ -267,47 +504,57 @@ def read_source(data):
     try:
         ast.parse(text)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
-        return None, "Is file me syntax error hai. Pehle use theek karke dobara bhejo."
+        return None, SYNTAX_MSG
     return text, None
 
 
 # ---- The option logic (no Telegram calls: easy to test) ------------------------------
 
-def _skip_phrase(kind, status):
-    name = "Web server" if kind == "web" else "Pinger"
-    if status == "sure":
-        return f"{name} ka code pehle se hai"
-    return f"{name} jaisa code lagta hai (pakka nahi)"
-
-
 def plan(source, choice):
-    """Returns (new_source, reply_text). new_source is None when nothing needs adding."""
-    web = web_server_status(source)
-    pin = pinger_status(source)
-    want_web = choice in (BTN_WEB, BTN_BOTH)
-    want_pin = choice in (BTN_PINGER, BTN_BOTH)
-    add_web = want_web and web == "none"
-    add_pin = want_pin and pin == "none"
-    skipped = []
-    if want_web and not add_web:
-        skipped.append(_skip_phrase("web", web))
-    if want_pin and not add_pin:
-        skipped.append(_skip_phrase("pinger", pin))
+    """Returns (new_source, reply_text). new_source is None when the file does not change; the
+    reply then says why. Only this bot's own marker blocks count as already there. Old web server
+    or pinger code of the chosen kind is removed, and our version is added in its place."""
+    want = set()
+    if choice in (BTN_WEB, BTN_BOTH):
+        want.add("web")
+    if choice in (BTN_PINGER, BTN_BOTH):
+        want.add("ping")
+    try:
+        res = _analyze(source, want)
+    except SyntaxError:
+        return None, SYNTAX_MSG
+    if res.error:
+        return None, res.error
 
-    if not add_web and not add_pin:
-        return None, ". ".join(skipped) + ". Isliye maine kuch add nahi kiya."
+    ours = {k for k in ("web", "ping") if k in want and _has_ours(source, k)}
+    add = want - ours
+    if not add and not res.found:
+        phrases = [f"{KIND_NAME[k]} ka code pehle se hai (bot ka apna)" for k in ("web", "ping") if k in want]
+        return None, ". ".join(phrases) + ". Isliye maine kuch add nahi kiya."
 
-    if add_web and add_pin:
-        text = "Web server aur pinger dono add kar diye."
-    elif add_web:
-        text = "Web server add kar diya."
-    else:
-        text = "Pinger add kar diya (default 5 minute)."
-        if web == "none":
+    base = res.text if res.found else source
+    new_source = inject(base, "web" in add, "ping" in add) if add else base
+
+    sentences = []
+    for k in ("web", "ping"):
+        if k not in want:
+            continue
+        name = KIND_NAME[k]
+        low = name.lower()
+        if k in ours and k in res.found:
+            sentences.append(f"{name} ka apna code pehle se hai, purana code hata diya")
+        elif k in ours:
+            sentences.append(f"{name} ka code pehle se hai (bot ka apna), isliye use chhoda")
+        elif k in res.found:
+            sentences.append(f"Purana {low} code hata kar naya {low} add kar diya")
+        else:
+            sentences.append(f"{name} add kar diya" + (" (default 5 minute)" if k == "ping" else ""))
+    text = ". ".join(sentences) + "."
+    if "ping" in add and "web" not in add:
+        web_there = "web" in ours or bool(_analyze(source, {"web"}).found)
+        if not web_there:
             text += " Pinger tabhi kaam karega jab bot par web server bhi chale."
-    for phrase in skipped:
-        text += f" {phrase}, isliye use chhoda."
-    return inject(source, add_web, add_pin), text
+    return new_source, text
 
 
 def status_block(source):
