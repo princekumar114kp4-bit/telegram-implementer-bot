@@ -1,8 +1,11 @@
 """Implementer bot (Hinglish messages).
 
-The owner sends a bot .py file. The bot shows 3 buttons. A tap adds a web server and/or a
-keep-alive pinger to a NEW copy of that file and sends the copy back. The original file is
-never changed.
+The owner sends a bot .py file. The bot shows what the file already has (web server, pinger)
+and 3 buttons. A tap adds a web server and/or a keep-alive pinger to a NEW copy of that file and
+sends the copy back as a document. The original file is never changed.
+
+Buttons (owner only): "Status dekho" shows what the last file has; "Pichli file lo" sends the last
+updated file again. Typed /status and /last still work (quietly, no hint is shown).
 
 This bot also keeps itself awake on Render: a small Flask web server ("/" and "/health" answer
 "ok") and a pinger that requests its own RENDER_EXTERNAL_URL every PING_MINUTES minutes.
@@ -34,7 +37,37 @@ BTN_WEB = "Web server add karo"
 BTN_PINGER = "Pinger add karo"
 BTN_BOTH = "Dono add karo"
 OPTIONS = (BTN_WEB, BTN_PINGER, BTN_BOTH)
-RESULT_NOTE = "Ye naya file hai. Ise Render par khud dobara deploy karna hoga. Purani file waisi hi rahegi."
+BTN_STATUS = "Status dekho"      # same as the typed /status
+BTN_LAST = "Pichli file lo"      # same as the typed /last
+INFO_BUTTONS = (BTN_STATUS, BTN_LAST)
+RESULT_NOTE = "ℹ️ Ye naya file hai. Ise Render par khud dobara deploy karna hoga. Purani file waisi hi rahegi."
+
+# Button fill colours. Telegram's "primary" is blue, "success" is green (the Bot API accepts only
+# "danger", "success", "primary" on reply keyboard buttons). The three options are blue, the two
+# info buttons are green. The label text does not change.
+BUTTON_STYLE = {BTN_WEB: "primary", BTN_PINGER: "primary", BTN_BOTH: "primary",
+                BTN_STATUS: "success", BTN_LAST: "success"}
+
+RULE = "━━━━━━━━━━━━━━"
+
+# Look of the bot's messages (text only). Button labels above stay exactly as they are.
+WELCOME = ("👋 Namaste! Main Bot Implementer hoon.\n"
+           f"{RULE}\n"
+           "📎 Apni bot ki .py file bhejo.\n"
+           "➕ Main web server aur/ya pinger add karke ek NAYI file bhejunga.\n"
+           "🔒 Aapki original file main nahi chhedunga.\n\n"
+           "File bhejne ke baad neeche ke option chuno:\n"
+           "🌐 Web server add karo\n"
+           "📡 Pinger add karo\n"
+           "🧩 Dono add karo\n\n"
+           "Kabhi bhi neeche ke buttons se:\n"
+           "📊 Status dekho: file me kya pehle se hai\n"
+           "🔁 Pichli file lo: pichli updated file dobara")
+STATUS_TEXT = {
+    "sure": "✅ pehle se hai",
+    "unsure": "❔ shayad hai (pakka nahi)",
+    "none": "➕ nahi hai, add ho sakta hai",
+}
 
 # ---- Code injected into the member's file ----------------------------------------------
 # Only top-level code: one daemon thread per block, each wrapped in try/except, every name
@@ -277,6 +310,18 @@ def plan(source, choice):
     return inject(source, add_web, add_pin), text
 
 
+def status_block(source):
+    """Two lines (web server, pinger) saying what the file already has. Text only."""
+    return (f"🌐 Web server: {STATUS_TEXT[web_server_status(source)]}\n"
+            f"📡 Pinger: {STATUS_TEXT[pinger_status(source)]}")
+
+
+def card(title, lines=(), footer=""):
+    """A status card: title, a rule, short lines, then an optional footer after a blank line."""
+    text = "\n".join([title, RULE, *lines])
+    return f"{text}\n\n{footer}" if footer else text
+
+
 # ---- Files on disk -------------------------------------------------------------------
 
 def safe_name(name):
@@ -309,14 +354,37 @@ def result_name(name):
     return f"{stem}-updated.py"
 
 
+def display_name(stored):
+    """The name the member sees: a saved name without its time stamp in front."""
+    return re.sub(r"^\d{8}-\d{6}-\d{3}-", "", stored)
+
+
+def latest_result(folder):
+    """Path of the newest saved result (.py) in the folder, or None. Newest by file time; the name
+    breaks a tie. (Names alone are not enough: two saves in the same second can share a counter.)"""
+    try:
+        paths = [os.path.join(folder, n) for n in os.listdir(folder) if n.lower().endswith(".py")]
+        if not paths:
+            return None
+        return max(paths, key=lambda p: (os.path.getmtime(p), p))
+    except OSError:
+        return None
+
+
 # ---- Telegram side -------------------------------------------------------------------
 
+def _button(label):
+    return types.KeyboardButton(label, style=BUTTON_STYLE[label])
+
+
 def option_keyboard():
-    """Reply keyboard: one button per row, exactly the 3 options."""
+    """Reply keyboard: the 3 options, one per row (as before), then a row with the 2 info buttons.
+    Each button has a fill colour (style) from BUTTON_STYLE."""
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(types.KeyboardButton(BTN_WEB))
-    kb.row(types.KeyboardButton(BTN_PINGER))
-    kb.row(types.KeyboardButton(BTN_BOTH))
+    kb.row(_button(BTN_WEB))
+    kb.row(_button(BTN_PINGER))
+    kb.row(_button(BTN_BOTH))
+    kb.row(_button(BTN_STATUS), _button(BTN_LAST))
     return kb
 
 
@@ -332,7 +400,7 @@ class Implementer:
         return self.owner is not None and user_id == self.owner
 
     def refuse(self, chat_id):
-        self.bot.send_message(chat_id, "Ye bot private hai.")
+        self.bot.send_message(chat_id, "🔒 Ye bot private hai.")
 
     def user_dir(self, chat_id, sub):
         return os.path.join(self.data_dir, str(int(chat_id)), sub)
@@ -342,15 +410,13 @@ class Implementer:
         uid = message.from_user.id
         if self.owner is None:
             # Same as the pinger bot: shows the user's own id, so the owner can set OWNER_ID.
-            self.bot.send_message(chat_id, f"Aapka Telegram ID: {uid}\n"
+            self.bot.send_message(chat_id, f"🆔 Aapka Telegram ID: {uid}\n\n"
                                   "Render me OWNER_ID naam ki env variable me ye ID daal, "
                                   "service restart karo, phir /start likho.")
             return
         if not self.is_owner(uid):
             return self.refuse(chat_id)
-        self.bot.send_message(chat_id, "Namaste! Apni bot ki .py file bhejo. Main uske liye "
-                              "web server aur/ya pinger add karke naya file bhejunga. "
-                              "Aapki original file ko main nahi chhedunga.")
+        self.bot.send_message(chat_id, WELCOME, reply_markup=option_keyboard())
 
     def on_document(self, message):
         chat_id = message.chat.id
@@ -359,25 +425,59 @@ class Implementer:
         doc = message.document
         raw_name = doc.file_name or ""
         if not raw_name.lower().endswith(".py"):
-            return self.bot.send_message(chat_id, "Sirf .py file bhejo. Dusri file ko main nahi chhedunga.")
+            return self.bot.send_message(chat_id, "⚠️ Sirf .py file bhejo. Dusri file ko main nahi chhedunga.")
         if (doc.file_size or 0) > MAX_BYTES:
-            return self.bot.send_message(chat_id, "Ye file bahut badi hai. Limit 300 KB hai.")
+            return self.bot.send_message(chat_id, "⚠️ Ye file bahut badi hai. Limit 300 KB hai.")
         try:
             info = self.bot.get_file(doc.file_id)
             data = self.bot.download_file(info.file_path)
         except Exception:
-            return self.bot.send_message(chat_id, "File download nahi ho payi. Dobara bhejo.")
+            return self.bot.send_message(chat_id, "⚠️ File download nahi ho payi. Dobara bhejo.")
         if not isinstance(data, bytes) or len(data) > MAX_BYTES:
-            return self.bot.send_message(chat_id, "File sahi se nahi aayi. Dobara bhejo.")
+            return self.bot.send_message(chat_id, "⚠️ File sahi se nahi aayi. Dobara bhejo.")
         source, err = read_source(data)
         if err:
-            return self.bot.send_message(chat_id, err)
+            return self.bot.send_message(chat_id, "⚠️ " + err)
         name = safe_name(raw_name)
         path = save_unique(self.user_dir(chat_id, "uploads"), name, data)
         with self.lock:
             self.pending[chat_id] = (path, name)
-        self.bot.send_message(chat_id, f"File mil gayi: {name}\nAb neeche se option chuno.",
+        self.bot.send_message(chat_id, card(f"📄 File mil gayi: {name}", [status_block(source)],
+                                            "Ab neeche se option chuno."),
                               reply_markup=option_keyboard())
+
+    def on_status(self, message):
+        chat_id = message.chat.id
+        if not self.is_owner(message.from_user.id):
+            return self.refuse(chat_id)
+        with self.lock:
+            pending = self.pending.get(chat_id)
+        if pending is None:
+            return self.bot.send_message(chat_id, "📭 Abhi koi file nahi hai. Pehle apni bot ki .py file bhejo.")
+        path, name = pending
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            return self.bot.send_message(chat_id, "⚠️ Wo file ab nahi mil rahi. Dobara bhejo.")
+        source, err = read_source(data)
+        if err:
+            return self.bot.send_message(chat_id, "⚠️ " + err)
+        self.bot.send_message(chat_id, card(f"📊 Status: {name}", [status_block(source)],
+                                            "Neeche se option chuno, ya nayi .py file bhejo."),
+                              reply_markup=option_keyboard())
+
+    def on_last(self, message):
+        chat_id = message.chat.id
+        if not self.is_owner(message.from_user.id):
+            return self.refuse(chat_id)
+        path = latest_result(self.user_dir(chat_id, "results"))
+        if path is None:
+            return self.bot.send_message(chat_id, "📭 Abhi koi updated file nahi bani hai. "
+                                         "Pehle file bhejo aur option chuno.")
+        with open(path, "rb") as f:
+            self.bot.send_document(chat_id, f, visible_file_name=display_name(os.path.basename(path)),
+                                   caption=card("🔁 Pichli updated file", [], RESULT_NOTE))
 
     def on_text(self, message):
         chat_id = message.chat.id
@@ -385,43 +485,56 @@ class Implementer:
             return self.refuse(chat_id)
         text = (message.text or "").strip()
         if text.startswith("/"):
-            return  # commands are handled by /start; unknown ones are ignored
+            return  # commands are handled by their own handlers; unknown ones are ignored
+        # The two info buttons go to the same handlers as the typed commands.
+        if text == BTN_STATUS:
+            return self.on_status(message)
+        if text == BTN_LAST:
+            return self.on_last(message)
         with self.lock:
             pending = self.pending.get(chat_id)
         if text not in OPTIONS:
             if pending is None:
-                return self.bot.send_message(chat_id, "Pehle apni bot ki .py file bhejo.")
-            return self.bot.send_message(chat_id, "Neeche ke button me se option chuno, "
+                return self.bot.send_message(chat_id, "📭 Pehle apni bot ki .py file bhejo.")
+            return self.bot.send_message(chat_id, "👇 Neeche ke button me se option chuno, "
                                          "ya nayi .py file bhejo.")
         if pending is None:
-            return self.bot.send_message(chat_id, "Pehle apni bot ki .py file bhejo.")
+            return self.bot.send_message(chat_id, "📭 Pehle apni bot ki .py file bhejo.")
         path, name = pending
         try:
             with open(path, "rb") as f:
                 data = f.read()
         except OSError:
-            return self.bot.send_message(chat_id, "Wo file ab nahi mil rahi. Dobara bhejo.")
+            return self.bot.send_message(chat_id, "⚠️ Wo file ab nahi mil rahi. Dobara bhejo.")
         source, err = read_source(data)
         if err:
-            return self.bot.send_message(chat_id, err)
+            return self.bot.send_message(chat_id, "⚠️ " + err)
         try:
             new_source, reply = plan(source, text)
         except Exception:
-            return self.bot.send_message(chat_id, "Kuch gadbad ho gayi, file nahi badli. "
+            return self.bot.send_message(chat_id, "⚠️ Kuch gadbad ho gayi, file nahi badli. "
                                          "Dobara try karo.")
         if new_source is None:
-            return self.bot.send_message(chat_id, reply)
+            return self.bot.send_message(chat_id, f"ℹ️ File nahi badli.\n\n{reply}")
         out_name = result_name(name)
         out_path = save_unique(self.user_dir(chat_id, "results"), out_name, new_source.encode("utf-8"))
         with open(out_path, "rb") as f:
             self.bot.send_document(chat_id, f, visible_file_name=out_name,
-                                   caption=f"{reply}\n\n{RESULT_NOTE}")
+                                   caption=card(f"✅ Naya file taiyaar hai: {out_name}", [reply], RESULT_NOTE))
 
 
 def register_handlers(bot, impl):
     @bot.message_handler(commands=["start", "help"])
     def _hyv_start(message):
         impl.on_start(message)
+
+    @bot.message_handler(commands=["status"])
+    def _hyv_status(message):
+        impl.on_status(message)
+
+    @bot.message_handler(commands=["last"])
+    def _hyv_last(message):
+        impl.on_last(message)
 
     @bot.message_handler(content_types=["document"])
     def _hyv_document(message):
