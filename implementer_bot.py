@@ -42,7 +42,32 @@ from telebot import types
 from telebot.apihelper import ApiException
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MAX_BYTES = 300 * 1024
+# Biggest .py file the bot takes. Default 1 MB. Set AI_MAX_FILE_KB in the environment to change it.
+# Telegram lets a bot download at most 20 MB, so the value is capped there.
+AI_MAX_FILE_KB_DEFAULT = 1024
+AI_MAX_FILE_KB_MIN = 20
+AI_MAX_FILE_KB_CAP = 20 * 1024
+
+
+def _ai_file_kb(raw):
+    """AI_MAX_FILE_KB from the environment text: a whole number, kept between the min and the cap."""
+    try:
+        kb = int(str(raw).strip()) if str(raw or "").strip() else AI_MAX_FILE_KB_DEFAULT
+    except ValueError:
+        kb = AI_MAX_FILE_KB_DEFAULT
+    return max(AI_MAX_FILE_KB_MIN, min(kb, AI_MAX_FILE_KB_CAP))
+
+
+AI_MAX_FILE_KB = _ai_file_kb(os.environ.get("AI_MAX_FILE_KB", ""))
+AI_MAX_BYTES = AI_MAX_FILE_KB * 1024
+MAX_BYTES = AI_MAX_BYTES                 # the same limit for every option (the file must be uploaded first)
+
+
+def size_limit_text():
+    """Plain Hinglish limit, for messages."""
+    kb = AI_MAX_FILE_KB
+    return f"{kb // 1024} MB" if kb % 1024 == 0 else f"{kb} KB"
+
 
 BTN_WEB = "🌐 Web server add karo"
 BTN_PINGER = "📡 Pinger add karo"
@@ -119,7 +144,8 @@ WELCOME = (f"👋 {fx_bold('Namaste!')} Main Bot Implementer hoon.\n"
            "📎 Apni bot ki .py file bhejo.\n"
            "➕ Main web server aur/ya pinger add karke ek NAYI file bhejunga.\n"
            "AI key set hone par purana web/pinger code hata ke naya daalta hai.\n"
-           "🔒 Aapki original file main nahi chhedunga.\n\n"
+           "🔒 Aapki original file main nahi chhedunga.\n"
+           f"📏 File ki limit {size_limit_text()} hai. Badi file me AI sirf zaroori hisse dekhta hai.\n\n"
            f"🧭 {fx_script('Options')}\n"
            "File bhejne ke baad neeche ke option chuno:\n"
            f"{BTN_WEB}\n"
@@ -1163,10 +1189,16 @@ AI_OPENAI_STYLE = {"openai": "https://api.openai.com/v1", "openrouter": "https:/
 AI_DEFAULT_BASE = AI_OPENAI_STYLE["openai"]
 AI_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/+-]{0,119}")
 AI_CONFIG_FILE = "ai_config.json"
-AI_TIMEOUT = 60           # seconds per call
+AI_TIMEOUT = 120          # seconds per call (a big prompt can take a while)
 AI_TRIES = 3              # first try plus 2 retries
-AI_MAX_TOKENS = 8192      # answer size asked from the AI
-AI_SRC_MAX = 30 * 1024    # the bot file sent to the AI must be this small
+AI_MAX_TOKENS = 8192      # answer size asked from the AI (every provider we use accepts this)
+AI_OUT_CAP = {"openai": 16384, "openrouter": 8192, "groq": 8192, "gemini": 8192, "anthropic": 8192}
+AI_FULL_REMOVE_MAX = 30 * 1024   # replace path: up to this size the whole file is sent (old way)
+AI_FULL_BACKUP_MAX = 20 * 1024   # backup path: up to this size the AI writes the whole file back
+AI_CHARS_PER_TOKEN = 3.5         # rough token estimate used for the prompt budget
+AI_PROMPT_TOKENS = 14000         # the whole prompt sent to the AI must stay under this
+AI_PROMPT_CHARS = int(AI_PROMPT_TOKENS * AI_CHARS_PER_TOKEN)
+AI_VIEW_MIN_ROOM = 4000          # chars that must stay free for code regions after the outline
 AI_OUT_MAX = 400 * 1024   # the AI answer must be this small
 AI_KEY_PROMPT = "Ab apni API key bhejo. Ye message main turant delete kar dunga, aur key kisi ko nahi dikhaunga."
 # Hosts the code this bot injects may call. The AI provider hosts (AI_OPENAI_STYLE, Gemini, Anthropic)
@@ -1320,6 +1352,7 @@ def ai_request(cfg, system, user, http, max_tokens=AI_MAX_TOKENS, timeout=AI_TIM
     """One call to the chosen provider. Returns the reply text. Raises AIError (safe text only)."""
     provider, key = cfg["provider"], cfg["key"]
     model = cfg.get("model") or AI_DEFAULT_MODEL[provider]
+    max_tokens = min(max_tokens, AI_OUT_CAP.get(provider, AI_MAX_TOKENS))   # never ask above a provider's cap
     if provider in AI_OPENAI_STYLE:
         base = (cfg.get("base_url") or AI_OPENAI_STYLE[provider]).rstrip("/")
         url = base + "/chat/completions"
@@ -1356,13 +1389,21 @@ def ai_request(cfg, system, user, http, max_tokens=AI_MAX_TOKENS, timeout=AI_TIM
     try:
         data = resp.json()
         if provider in AI_OPENAI_STYLE:
-            text = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            text = choice["message"]["content"]
+            cut = choice.get("finish_reason") == "length"
         elif provider == "gemini":
-            text = "".join(p.get("text", "") for p in data["candidates"][0]["content"]["parts"])
+            cand = data["candidates"][0]
+            text = "".join(p.get("text", "") for p in cand["content"]["parts"])
+            cut = cand.get("finishReason") == "MAX_TOKENS"
         else:
             text = "".join(b.get("text", "") for b in data["content"] if b.get("type") == "text")
+            cut = data.get("stop_reason") == "max_tokens"
     except (KeyError, IndexError, TypeError, ValueError, AttributeError):
         raise AIError("AI ka jawab samajh nahi aaya.", retry=True)
+    if cut:
+        # A cut-off answer is not retried: the same request would be cut off again.
+        raise AIError("AI ka jawab beech me kat gaya (wo bahut lamba ho gaya). Isliye kuch nahi badla.", retry=False)
     if not isinstance(text, str) or not text.strip():
         raise AIError("AI ne khaali jawab diya.", retry=True)
     return text
@@ -1388,7 +1429,8 @@ def check_ai_output(original, new, admin_id):
     no secret, no unknown web address and no dangerous call."""
     if not new.strip():
         return "AI ne khaali file di."
-    if len(new.encode("utf-8")) > AI_OUT_MAX:
+    # the answer may add at most AI_OUT_MAX bytes to the file (a big file is kept, only the new part is capped)
+    if len(new.encode("utf-8")) - len(original.encode("utf-8")) > AI_OUT_MAX:
         return "AI ki file bahut badi hai."
     try:
         tree = ast.parse(new)
@@ -1412,15 +1454,25 @@ def check_ai_output(original, new, admin_id):
     if gone:
         return f"AI ne bot ka purana code hata diya ({', '.join(gone[:3])})."
     old_lines, new_lines = original.splitlines(), new.splitlines()
+    # the same lines at the start and the end are skipped first: the diff then only looks at the changed part
+    # (a big file with a small change would take minutes otherwise)
+    pre, suf = 0, 0
+    lim = min(len(old_lines), len(new_lines))
+    while pre < lim and old_lines[pre] == new_lines[pre]:
+        pre += 1
+    while suf < lim - pre and old_lines[len(old_lines) - 1 - suf] == new_lines[len(new_lines) - 1 - suf]:
+        suf += 1
+    old_mid = old_lines[pre:len(old_lines) - suf]
+    new_mid = new_lines[pre:len(new_lines) - suf]
     removed, added = 0, []
-    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False).get_opcodes():
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old_mid, new_mid, autojunk=False).get_opcodes():
         if tag in ("replace", "delete"):
-            for line in old_lines[i1:i2]:
+            for line in old_mid[i1:i2]:
                 if re.match(r"\s*(async\s+def|def|class)\s", line):
                     return "AI ne purane function ya class ki line badal di."
             removed += i2 - i1
         if tag in ("replace", "insert"):
-            added.extend(new_lines[j1:j2])
+            added.extend(new_mid[j1:j2])
     if removed > 6:
         return "AI ne purane code me bahut badlaav kiya."
     added_text = "\n".join(added)
@@ -1474,8 +1526,11 @@ def ai_prompt(source, admin_id, lib, reason=None):
 def ai_inject_backup(source, admin_id, cfg, http=None, lib=None):
     """Asks the AI for the injection. Every answer is checked; a rejected answer goes back with the reason,
     up to AI_TRIES times. Returns (new_source, None) or (None, reason). Never raises."""
-    if len(source.encode("utf-8")) > AI_SRC_MAX:
-        return None, "Ye file AI ke liye bahut badi hai (limit 30 KB)."
+    size = len(source.encode("utf-8"))
+    if size > AI_MAX_BYTES:
+        return None, too_big_text(size)
+    if size > AI_FULL_BACKUP_MAX:
+        return ai_inject_backup_block(source, admin_id, cfg, http, lib)
     http = http if http is not None else requests
     reason = None
     for _ in range(AI_TRIES):
@@ -1488,6 +1543,285 @@ def ai_inject_backup(source, admin_id, cfg, http=None, lib=None):
             continue
         new_source = extract_code(reply)
         reason = check_ai_output(source, new_source, admin_id)
+        if reason is None:
+            return new_source, None
+    return None, f"AI ne {AI_TRIES} koshish ke baad bhi sahi code nahi diya (aakhri wajah: {reason})."
+
+
+# ---- Big files: the AI gets a compact view, never the whole file ------------------------------
+# The outline lists the top-level statements. The regions are numbered with the file's own line
+# numbers, COMPACT_CONTEXT lines around each line that matters. Regions that do not fit the prompt
+# budget are left out and named by line range, and the member is told about it.
+
+COMPACT_CONTEXT = 30
+TOO_BIG_PREFIX = "Ye file bahut badi hai."
+REMOVE_ANCHORS = re.compile(
+    r"\b(?:Flask|HTTPServer|http\.server|aiohttp|fastapi|FastAPI|uvicorn|serve_forever|app\.run|PORT"
+    r"|requests|urllib|sleep|RENDER_EXTERNAL_URL|Thread|while\s+True|(?i:ping\w*|keep_alive))\b")
+BACKUP_ANCHORS = re.compile(
+    r"\b(?:TeleBot|SafeTeleBot|Application\s*\.\s*builder|Updater|message_handler|callback_query_handler"
+    r"|CommandHandler|MessageHandler|add_handler|ReplyKeyboardMarkup|InlineKeyboardMarkup|KeyboardButton"
+    r"|infinity_polling|run_polling|start_polling)\b|\bdef\s+main\b|__name__\s*==|\.idle\s*\(")
+AI_BLOCK_SYSTEM = ("You write one code block for the Database Export/Import feature of one Python Telegram bot "
+                   "file. You never send the whole file. Reply only with the requested python block and the "
+                   "REGISTER line.")
+BLOCK_REGISTER = re.compile(r"REGISTER\s+AFTER\s+LINE\s+(\d+)\s+VAR\s+([A-Za-z_]\w*)")
+
+
+class ViewTooBig(Exception):
+    """The fixed parts of a prompt (task, outline, candidates) alone do not fit the budget."""
+
+
+def too_big_text(size=None):
+    """Plain refusal for a file over the AI limit: the real reason and the limit."""
+    got = f" Aapki file lagbhag {max(1, round(size / 1024))} KB ki hai." if size else ""
+    return (f"{TOO_BIG_PREFIX}{got} Limit {size_limit_text()} hai. Bot ka purana ya faltu bada hissa hata kar, "
+            "ya file ko do chhote hisso me bant kar dobara bhejo.")
+
+
+def too_big_view_text():
+    return (f"{TOO_BIG_PREFIX} AI ko bhejne layak chhota view (outline aur code ke hisse) bhi AI ki limit "
+            f"(lagbhag {AI_PROMPT_TOKENS} tokens) se bada ho gaya. Bot ko do chhote hisso me bant kar bhejo.")
+
+
+def _ranges_text(ranges, limit=30):
+    text = ", ".join(f"{s}-{e}" for s, e in ranges[:limit])
+    more = len(ranges) - limit
+    return text + (f" aur {more} aur" if more > 0 else "")
+
+
+def _merge_spans(spans):
+    out = []
+    for s, e in sorted(spans):
+        if out and s <= out[-1][1] + 1:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return [(s, e) for s, e in out]
+
+
+def _minus_spans(spans, cut):
+    """The parts of the (start, end) spans that are not inside any span of cut."""
+    out = []
+    for s, e in spans:
+        cur = s
+        for a, b in cut:
+            if b < cur or a > e:
+                continue
+            if a > cur:
+                out.append((cur, a - 1))
+            cur = max(cur, b + 1)
+            if cur > e:
+                break
+        if cur <= e:
+            out.append((cur, e))
+    return out
+
+
+def _render_region(lines, s, e):
+    body = "\n".join(f"{i:>6}| {lines[i - 1][:200]}" for i in range(s, e + 1))
+    return f"--- lines {s}-{e} ---\n{body}"
+
+
+def compact_prompt(head, source, pattern, priority_lines, tail):
+    """Prompt for a big file: head (task text), the outline, numbered regions, then tail. The regions are
+    COMPACT_CONTEXT lines around each priority line (a candidate) and each line matching pattern; the
+    priority ones are taken first. Returns (prompt, hidden): hidden lists the (start, end) regions left out
+    for size. Raises ViewTooBig when the fixed parts or the first useful regions do not fit."""
+    lines = source.splitlines()
+    tree = ast.parse(source)
+    fixed = len(head) + len(tail) + 1500          # 1500: headers and the trim note
+    outline_budget = max(0, (AI_PROMPT_CHARS - fixed) // 3)
+    out_rows, used_rows = [], 0
+    for n in tree.body:
+        s, e = _span(n)
+        row = f"- lines {s}-{e}: {lines[s - 1].strip()[:60]}"
+        if used_rows + len(row) + 1 > outline_budget:
+            break
+        out_rows.append(row)
+        used_rows += len(row) + 1
+    if len(out_rows) < len(tree.body):
+        out_rows.append(f"- ... {len(tree.body) - len(out_rows)} more top-level lines not listed here")
+    outline = "\n".join(out_rows)
+    room = AI_PROMPT_CHARS - fixed - len(outline)
+    if room < AI_VIEW_MIN_ROOM:
+        raise ViewTooBig()
+    n_lines = len(lines)
+    pref = [0]
+    for ln in lines:
+        pref.append(pref[-1] + min(len(ln), 200) + 9)     # 9: "{n:>6}| " and the newline
+
+    def window(p):
+        return (max(1, p - COMPACT_CONTEXT), min(n_lines, p + COMPACT_CONTEXT))
+
+    def cost(s, e):
+        return pref[e] - pref[s - 1] + 25                 # 25: the "--- lines s-e ---" header
+
+    prio = sorted(set(priority_lines))
+    prio_set = set(prio)
+    chosen, hidden, used = [], [], 0
+
+    def take(s, e):
+        nonlocal used
+        if used + cost(s, e) <= room:
+            chosen.append((s, e))
+            used += cost(s, e)
+            return True
+        return False
+
+    for s, e in _merge_spans([window(p) for p in prio]):
+        if take(s, e):
+            continue
+        for p in prio:                                    # too big as one piece: try each candidate alone
+            if s <= p <= e and not take(*window(p)):
+                hidden.append(window(p))
+    others = sorted({a for a in pattern_lines(lines, pattern) if a not in prio_set})
+    last = 0                                              # windows are taken one by one, never past the last one
+    for a in others:
+        s, e = window(a)
+        s = max(s, last + 1)
+        if s > e:
+            continue
+        if not take(s, e):
+            hidden.append((s, e))
+        last = e
+    chosen = _merge_spans(chosen)
+    hidden = _minus_spans(_merge_spans(hidden), chosen)
+    body = "\n".join(_render_region(lines, s, e) for s, e in chosen)
+    note = ""
+    if hidden:
+        note = ("\n\nSome regions were left out to keep the prompt small. Lines not shown: "
+                + _ranges_text(hidden) + ".")
+    prompt = (f"{head}\n\nOutline (line ranges of the top-level code):\n{outline}\n\n"
+              f"Code regions (the numbers at the left are the file's real line numbers):\n{body}{note}{tail}")
+    if len(prompt) > AI_PROMPT_CHARS:
+        raise ViewTooBig()
+    return prompt, hidden
+
+
+def pattern_lines(lines, pattern):
+    """1-based numbers of the lines that match pattern."""
+    return [i for i, ln in enumerate(lines, 1) if pattern.search(ln)]
+
+
+def trim_note(hidden):
+    """What the member is told when some regions were left out of the AI's view."""
+    if not hidden:
+        return None
+    return ("File lambi thi, isliye AI ko sirf kuch hisse dikhaye gaye. Ye lines AI ne nahi dekhi: "
+            + _ranges_text(hidden) + ".")
+
+
+def backup_block_head(lib, admin_id):
+    ref = backup_block(lib or "telebot", admin_id)
+    lib_name = {"telebot": "pyTelegramBotAPI (telebot)", "ptb": "python-telegram-bot v20+"}.get(
+        lib, "unknown or not supported by the templates")
+    rules = [
+        "Write ONLY the new Export/Import block for the bot file below. The bot file is not sent back and "
+        "its code must not be rewritten.",
+        f"The bot library: {lib_name}. Use that library's own handler, keyboard and reply calls.",
+        f"Put the Telegram id {admin_id} in the line `_HYV_BK_ADMINS = {{{admin_id}}}`. Only that id and the "
+        "env variable HYV_ADMIN_IDS make an admin.",
+        "Start the block with `# >>> hyv-injected:backup (added by the implementer bot)` and end it with "
+        "`# <<< hyv-injected:backup`. Use exactly one of each.",
+        "Every new name must start with `_hyv_bk_` or `_HYV_BK_`. Do not redefine any existing name.",
+        "Admin only: the button `🗄 Database Export/Import` shows only to admins, with `📤 Export`, `📥 Import` "
+        "and `🔙 Back`.",
+        "Export and Import work as in the reference block. Import checks the manifest and sha256, refuses "
+        "absolute paths and '..', and keeps a safety copy.",
+        "Wrap the new handlers so an error is caught and reported in a short message. Never change the bot's "
+        "normal behaviour.",
+        "No hard-coded tokens or keys. No web addresses except the library's own Telegram calls. No eval, exec, "
+        "subprocess, os.system, socket or extra HTTP libraries.",
+        "After the block, on its own line, write: REGISTER AFTER LINE <n> VAR <name>. n is the last line number "
+        "of the top-level statement that creates the bot object, and name is the variable that statement "
+        "assigns. Take both from the outline or the regions.",
+        "Output: one ```python block holding only the new block, then the REGISTER line. Nothing else.",
+    ]
+    head = "Task:\n" + "\n".join(f"- {r}" for r in rules)
+    return head + ("\n\nWorking reference block (adapt the calls to the bot's library):\n```python\n"
+                   + ref + "\n```")
+
+
+def assemble_block_reply(source, reply, admin_id):
+    """The original file with the AI's block added: the register line after the bot statement, the block
+    after the imports. Raises RemovalError when the reply does not match the file."""
+    m = re.search(r"```[ \t]*(?:python|py)?[ \t]*\n(.*?)```", reply or "", re.S | re.I)
+    reg = BLOCK_REGISTER.search(reply or "")
+    if not m or not reg:
+        raise RemovalError("AI ne block ya REGISTER line sahi format me nahi di.")
+    block = m.group(1).strip("\n") + "\n"
+    if block.count("# >>> hyv-injected:backup") != 1 or block.count("# <<< hyv-injected:backup") != 1:
+        raise RemovalError("AI ne backup ka start aur end marker sahi nahi lagaya.")
+    try:
+        block_tree = ast.parse(block)
+    except (SyntaxError, ValueError):
+        raise RemovalError("AI ka block compile nahi hua (syntax galat hai).")
+    tree = ast.parse(source)
+    old_top = {n.name for n in tree.body if isinstance(n, DEF_KINDS)}
+    if any(isinstance(n, DEF_KINDS) and n.name in old_top for n in block_tree.body):
+        raise RemovalError("AI ne bot ka purana function ya class dobara likh diya.")
+    reg_no, var = int(reg.group(1)), reg.group(2)
+    stmt = next((n for n in tree.body if not isinstance(n, (ast.Import, ast.ImportFrom))
+                 and n.lineno <= reg_no <= n.end_lineno and var in _bound(n)), None)
+    if stmt is None:
+        raise RemovalError(f"REGISTER line ({reg_no}, {var}) bot ki line se nahi mili. Sahi line batao.")
+    lines = source.splitlines(keepends=True)
+    end = stmt.end_lineno
+    if not lines[end - 1].endswith("\n"):
+        lines[end - 1] += "\n"
+    lines.insert(end, f"_hyv_bk_register({var})  # hyv-injected:backup-register\n")
+    src1 = "".join(lines)
+    body = ast.parse(src1).body
+    k = 0
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+            and isinstance(body[0].value.value, str):
+        k = 1
+    while k < len(body) and isinstance(body[k], (ast.Import, ast.ImportFrom)):
+        k += 1
+    at = body[k - 1].end_lineno if k else 0
+    if at > end:
+        raise RemovalError("Imports bot banane wali line ke baad aate hain, isliye block sahi jagah nahi lag sakta.")
+    l1 = src1.splitlines(keepends=True)
+    head_part, tail_part = l1[:at], l1[at:]
+    if head_part and not head_part[-1].endswith("\n"):
+        head_part[-1] += "\n"
+    return "".join(head_part) + "\n" + block + "\n" + "".join(tail_part)
+
+
+def ai_inject_backup_block(source, admin_id, cfg, http=None, lib=None):
+    """Big files (over AI_FULL_BACKUP_MAX): the AI sees a compact view and writes only the block and one
+    register line. The code adds them and checks the whole result, like the full-file path does.
+    Returns (new_source, None) or (None, reason). Never raises."""
+    http = http if http is not None else requests
+    head = backup_block_head(lib, admin_id)
+    reason = None
+    for _ in range(AI_TRIES):
+        tail = "\n\nReply with the python block and the REGISTER line."
+        if reason:
+            tail += f"\n\nYour previous answer was rejected because: {reason[:400]} Fix it and send them again."
+        try:
+            prompt, _hidden = compact_prompt(head, source, BACKUP_ANCHORS, [], tail)
+        except ViewTooBig:
+            return None, too_big_view_text()
+        try:
+            reply = ai_request(cfg, AI_BLOCK_SYSTEM, prompt, http)
+        except AIError as e:
+            if not e.retry:
+                return None, f"AI se kaam nahi ho paya: {e}"
+            reason = str(e)
+            continue
+        if len((reply or "").encode("utf-8")) > AI_OUT_MAX:
+            reason = "AI ka jawab bahut bada hai."
+            continue
+        try:
+            new_source = assemble_block_reply(source, reply, admin_id)
+        except RemovalError as e:
+            reason = str(e)
+            continue
+        reason = check_ai_output(source, new_source, admin_id)
+        if reason is None and new_source.count("hyv-injected:backup-register") != 1:
+            reason = "AI ne register line sahi jagah nahi lagayi."
         if reason is None:
             return new_source, None
     return None, f"AI ne {AI_TRIES} koshish ke baad bhi sahi code nahi diya (aakhri wajah: {reason})."
@@ -1566,10 +1900,11 @@ def _marker_ranges(lines, kind):
     return out
 
 
-def _base_match(node, kind, head, text, markers, source):
+def _base_match(node, kind, head, text, markers, targets):
     """Is this statement plainly part of the old web server or pinger? head is the text a def is judged
-    by (its decorators and header), text is the whole statement. Sure patterns only, plus a thread
-    target that sleeps and makes web requests."""
+    by (its decorators and header), text is the whole statement, targets the names used as a thread
+    target somewhere in the file. Sure patterns only, plus a thread target that sleeps and makes web
+    requests."""
     s, e = _span(node)
     if any(a <= s and e <= b for a, b in markers):
         return True
@@ -1578,7 +1913,7 @@ def _base_match(node, kind, head, text, markers, source):
     if _any(PINGER_SURE, head, re.I | re.M):
         return True
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        return (bool(re.search(rf"target\s*=\s*{node.name}\b", source))
+        return (node.name in targets
                 and bool(re.search(PERIODIC_SLEEP, text)) and bool(re.search(PERIODIC_HTTP, text)))
     return False
 
@@ -1586,8 +1921,9 @@ def _base_match(node, kind, head, text, markers, source):
 def _related(tree, lines, kinds):
     """Statements that belong to the chosen kinds: the plain matches, plus every statement that
     depends on a name those matches bind (for example the thread start that calls run_web)."""
-    source = "\n".join(lines)
+    targets = set(re.findall(r"target\s*=\s*(\w+)", "\n".join(lines)))
     stmts = _stmts(tree)
+    own = {n: _own_names(n) for n in stmts}
     segs = {n: "\n".join(lines[_span(n)[0] - 1:_span(n)[1]]) for n in stmts}
     heads = {}
     for n in stmts:
@@ -1603,7 +1939,7 @@ def _related(tree, lines, kinds):
     for kind in kinds:
         markers = _marker_ranges(lines, kind)
         cur = {n for n in stmts if n not in forbidden
-               and _base_match(n, kind, heads[n], segs[n], markers, source)}
+               and _base_match(n, kind, heads[n], segs[n], markers, targets)}
         changed = True
         while changed:
             changed = False
@@ -1613,7 +1949,7 @@ def _related(tree, lines, kinds):
             for n in stmts:
                 if n in cur or n in forbidden:
                     continue
-                by_name = bool(_own_names(n) & names)
+                by_name = bool(own[n] & names)
                 # a def is a unit when all of its body is related (a thread target, for example)
                 by_body = isinstance(n, DEF_KINDS) and bool(n.body) and all(b in cur for b in n.body)
                 # the sleep line of a pinger loop belongs to the pinger
@@ -1677,6 +2013,7 @@ def _remove_code(source, picks, kinds):
         removed.add(by_span[pick])
 
     markers = {k: _marker_ranges(plain, k) for k in kinds}
+    own = {n: _own_names(n) for n in stmts}
     changed = True
     while changed:
         changed = False
@@ -1684,7 +2021,7 @@ def _remove_code(source, picks, kinds):
         for n in removed:
             names |= _bound(n)
         for n in stmts:                       # dependants of removed names
-            if gone(n) or not (_own_names(n) & names):
+            if gone(n) or not (own[n] & names):
                 continue
             if n not in rel:
                 raise RemovalError(f"Line {spans[n][0]} ka code hataye gaye code par depend karta hai, "
@@ -1814,18 +2151,50 @@ def _remove_prompt(source, kinds, cands, reason=None):
     return text
 
 
-def ai_remove_old(source, kinds, cfg, http=None):
+def _remove_head(kinds, cands):
+    """The task part of the removal prompt for a big file (the file itself comes as regions)."""
+    what = " and ".join("web server" if k == "web" else "pinger" for k in kinds)
+    return (f"Task: the owner wants a new {what} added to this bot. Pick the OLD {what} code to delete.\n"
+            "- Pick only from the candidate list. Use the start and end line exactly as listed.\n"
+            "- Never pick the bot's handlers, the polling or run call, the main entry, the bot object, or unrelated code.\n"
+            "- Pick the statements that exist only for the old web server or pinger (imports, the app object, routes, "
+            "the thread start, the function itself).\n"
+            'Reply only with JSON: {"remove": [[start, end], ...]}\n\n'
+            "Candidates:\n" + "\n".join(f"- lines {s}-{e}: {first}" for s, e, first in cands))
+
+
+def ai_remove_old(source, kinds, cfg, http=None, notes=None):
     """Asks the AI which old code to delete, checks the answer, and applies it. Up to AI_TRIES tries.
+    Small files go in whole. Bigger files (up to AI_MAX_BYTES) go as a compact view: the outline plus
+    numbered regions around the old code. Trimmed regions are described in notes for the member.
     Returns (new_source, removed, None) or (None, None, reason). Never raises."""
-    if len(source.encode("utf-8")) > AI_SRC_MAX:
-        return None, None, "Ye file AI ke liye bahut badi hai (limit 30 KB)."
+    size = len(source.encode("utf-8"))
+    if size > AI_MAX_BYTES:
+        return None, None, too_big_text(size)
     http = http if http is not None else requests
     cands = _candidate_lines(source, kinds)
+    whole = size <= AI_FULL_REMOVE_MAX
+    head = None if whole else _remove_head(kinds, cands)
+    priority = [s for s, _e, _f in cands]
+
+    def make(reason):
+        if whole:
+            return _remove_prompt(source, kinds, cands, reason), []
+        tail = "\n\nReply only with JSON: {\"remove\": [[start, end], ...]}"
+        if reason:
+            tail += f"\n\nYour previous answer was rejected because: {reason[:400]} Fix it and send the JSON again."
+        return compact_prompt(head, source, REMOVE_ANCHORS, priority, tail)
+
+    try:
+        make(None)
+    except ViewTooBig:
+        return None, None, too_big_view_text()
     reason = None
+    hidden = []
     for _ in range(AI_TRIES):
+        prompt, hidden = make(reason)
         try:
-            reply = ai_request(cfg, AI_REMOVE_SYSTEM, _remove_prompt(source, kinds, cands, reason), http,
-                               max_tokens=2048)
+            reply = ai_request(cfg, AI_REMOVE_SYSTEM, prompt, http, max_tokens=2048)
         except AIError as e:
             if not e.retry:
                 return None, None, f"AI se kaam nahi ho paya: {e}"
@@ -1833,9 +2202,12 @@ def ai_remove_old(source, kinds, cfg, http=None):
             continue
         try:
             new_source, removed = _remove_code(source, _parse_picks(reply), kinds)
-            return new_source, removed, None
         except RemovalError as e:
             reason = str(e)
+            continue
+        if notes is not None and hidden:
+            notes.append(trim_note(hidden))
+        return new_source, removed, None
     return None, None, reason
 
 
@@ -1863,8 +2235,11 @@ def plan_replace(source, choice, targets, web, pin, ai_cfg, http=None):
     want_pin = choice in (BTN_PINGER, BTN_BOTH)
     add_web = want_web and (web == "none" or "web" in targets)
     add_pin = want_pin and (pin == "none" or "pinger" in targets)
-    new_source, removed, err = ai_remove_old(source, targets, ai_cfg, http)
+    notes = []
+    new_source, removed, err = ai_remove_old(source, targets, ai_cfg, http, notes)
     if new_source is None:
+        if err and err.startswith(TOO_BIG_PREFIX):
+            return None, f"{err} File waisi hi rahegi."
         return None, (f"AI purana code sahi pehchan nahi paya ({err}). Isliye kuch nahi badla. "
                       "File waisi hi rahegi.")
     try:
@@ -1880,6 +2255,7 @@ def plan_replace(source, choice, targets, web, pin, ai_cfg, http=None):
         text.append("Ye purana code hataya:")
         for s, e, label in removed:
             text.append(f"- line {s}" if s == e else f"- line {s}-{e}: {label}")
+    text.extend(notes)
     text.append("Ye naya code jodha:")
     if add_web:
         s, e = _marker_lines(out, "web")
@@ -2135,7 +2511,7 @@ class Implementer:
         if not raw_name.lower().endswith(".py"):
             return self.bot.send_message(chat_id, warn("Sirf .py file bhejo. Dusri file ko main nahi chhedunga."))
         if (doc.file_size or 0) > MAX_BYTES:
-            return self.bot.send_message(chat_id, warn("Ye file bahut badi hai. Limit 300 KB hai."))
+            return self.bot.send_message(chat_id, warn(too_big_text(doc.file_size)))
         prog = Progress(self.bot, chat_id, self.pause)
         prog.start()
         try:
@@ -2144,7 +2520,9 @@ class Implementer:
                 data = self.bot.download_file(info.file_path)
             except Exception:
                 return self.bot.send_message(chat_id, warn("File download nahi ho payi. Dobara bhejo."))
-            if not isinstance(data, bytes) or len(data) > MAX_BYTES:
+            if isinstance(data, bytes) and len(data) > MAX_BYTES:
+                return self.bot.send_message(chat_id, warn(too_big_text(len(data))))
+            if not isinstance(data, bytes):
                 return self.bot.send_message(chat_id, warn("File sahi se nahi aayi. Dobara bhejo."))
             source, err = read_source(data)
             if err:
