@@ -26,6 +26,7 @@ Render par setup:
 Buttons (owner ke liye, neeche ke keyboard me):
 - "Web server add karo", "Pinger add karo", "Dono add karo": web server, pinger ya dono jodta hai.
   Pinger ke liye web server zaroori hai, isliye Render par "Dono add karo" chuniye.
+AI key set ho to web/pinger options pehle purana web server/pinger code hata ke naya jodte hain.
 - "Database Export/Import": owner/admin ke liye backup (export) aur restore (import). Import ke baad bot restart karein.
 - "AI key set karo": AI key save karta hai. Ye sirf Database Export/Import ke liye chahiye.
   Render par AI_API_KEY env variable se bhi de sakte hain (optional).
