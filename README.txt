@@ -3,6 +3,7 @@ Implementer bot - kaise chalana hai
 Ye bot aapki bot ki .py file leti hai aur usme do cheez jod sakti hai:
 - Web server (Render ko open port chahiye, isliye "/" aur "/health" par "ok" aata hai)
 - Pinger (RENDER_EXTERNAL_URL par har kuch minute me ping karta hai, taki bot so na jaye)
+Bade files ke liye AI sirf kaam ke hisse dekhta hai, limit 1 MB.
 
 Ye bot khud bhi yahi dono cheez karta hai: iska apna web server hai aur ye apne aap ko
 ping karta hai, taki Render ke free plan par ye bot bhi so na jaye.
