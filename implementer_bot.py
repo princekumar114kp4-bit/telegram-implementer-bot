@@ -18,6 +18,10 @@ Env:
   RENDER_EXTERNAL_URL  set by Render for a Web Service; the pinger calls it (skipped when unset)
   PING_MINUTES    optional; minutes between self-pings, 1 to 60 (default 5)
   AI_API_KEY      optional; AI key used only when the Database Export/Import option needs AI
+  AI_PROVIDER     optional; openai, openrouter, groq, gemini or anthropic (default: from the key prefix)
+  AI_MODEL        optional; model name, overrides the model saved with /aimodel
+  AI_BASE_URL     optional; API base address for an OpenAI-compatible provider
+  AI_REFERER      optional; sent as HTTP-Referer to OpenRouter (not sent when unset)
   HYV_ADMIN_IDS   optional; extra Telegram ids (comma separated) allowed to use Database Export/Import
                   in a bot that gets the feature added
 """
@@ -1147,10 +1151,16 @@ def plan_backup(source, admin_id=None, ai_cfg=None, http=None):
 # ---- AI (optional). The owner adds an API key with the AI button. The key is never printed,
 # logged or echoed back. It is kept in a 0600 file in the data folder, or read from AI_API_KEY.
 
-AI_PROVIDERS = ("openai", "gemini", "anthropic")
-AI_NAME = {"openai": "OpenAI (ya OpenAI jaisi service)", "gemini": "Google Gemini", "anthropic": "Anthropic Claude"}
-AI_DEFAULT_MODEL = {"openai": "gpt-4o-mini", "gemini": "gemini-2.0-flash", "anthropic": "claude-3-5-haiku-latest"}
-AI_DEFAULT_BASE = "https://api.openai.com/v1"
+AI_PROVIDERS = ("openai", "gemini", "anthropic", "openrouter", "groq")
+AI_NAME = {"openai": "OpenAI", "gemini": "Google Gemini", "anthropic": "Anthropic Claude",
+           "openrouter": "OpenRouter", "groq": "Groq"}
+AI_DEFAULT_MODEL = {"openai": "gpt-4o-mini", "gemini": "gemini-2.0-flash", "anthropic": "claude-3-5-haiku-latest",
+                    "openrouter": "anthropic/claude-sonnet-5.5", "groq": "llama-3.3-70b-versatile"}
+# OpenAI-style providers (chat/completions with a Bearer key). Only the address differs.
+AI_OPENAI_STYLE = {"openai": "https://api.openai.com/v1", "openrouter": "https://openrouter.ai/api/v1",
+                   "groq": "https://api.groq.com/openai/v1"}
+AI_DEFAULT_BASE = AI_OPENAI_STYLE["openai"]
+AI_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/+-]{0,119}")
 AI_CONFIG_FILE = "ai_config.json"
 AI_TIMEOUT = 60           # seconds per call
 AI_TRIES = 3              # first try plus 2 retries
@@ -1158,8 +1168,12 @@ AI_MAX_TOKENS = 8192      # answer size asked from the AI
 AI_SRC_MAX = 30 * 1024    # the bot file sent to the AI must be this small
 AI_OUT_MAX = 400 * 1024   # the AI answer must be this small
 AI_KEY_PROMPT = "Ab apni API key bhejo. Ye message main turant delete kar dunga, aur key kisi ko nahi dikhaunga."
+# Hosts the code this bot injects may call. The AI provider hosts (AI_OPENAI_STYLE, Gemini, Anthropic)
+# are NOT here: they are used only by this bot's own AI calls, never by a member's injected code.
 AI_ALLOWED_HOSTS = ("api.telegram.org", "localhost", "127.0.0.1")
-AI_SECRET = re.compile(r"\d{8,12}:[A-Za-z0-9_-]{30,}|sk-[A-Za-z0-9_-]{16,}|AIza[0-9A-Za-z_-]{30,}")
+# Token and key shapes. sk-or-v1-... (OpenRouter) is listed on its own, the generic sk- rule covers it too.
+AI_SECRET = re.compile(r"\d{8,12}:[A-Za-z0-9_-]{30,}|sk-or-[A-Za-z0-9_-]{16,}|sk-[A-Za-z0-9_-]{16,}"
+                       r"|gsk_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{30,}")
 AI_BAD_CALLS = re.compile(r"\b(os\.system|subprocess|eval\s*\(|exec\s*\(|__import__|pickle\.loads)")
 AI_BAD_IMPORTS = re.compile(r"^\s*(import|from)\s+(socket|urllib|http\.client|httpx|aiohttp|requests)\b", re.M)
 AI_URL_HOST = re.compile(r"https?://([^/\s\"'):]+)", re.I)
@@ -1183,13 +1197,24 @@ def mask_key(key):
 
 
 def detect_provider(key):
+    """Provider from the key prefix. The order matters: sk-ant- and sk-or- are checked before the
+    generic sk- (OpenAI) rule, otherwise an OpenRouter key would be sent to OpenAI."""
     if key.startswith("sk-ant-"):
         return "anthropic"
+    if key.startswith("sk-or-"):
+        return "openrouter"
+    if key.startswith("gsk_"):
+        return "groq"
     if key.startswith("AIza"):
         return "gemini"
     if key.startswith("sk-"):
         return "openai"
     return None
+
+
+def redact_secrets(text):
+    """Any token or key shape in a text is replaced before the text is shown or logged."""
+    return AI_SECRET.sub("<hidden>", str(text))
 
 
 def _read_saved_ai(data_dir):
@@ -1222,17 +1247,34 @@ def load_ai_config(data_dir):
     return {"provider": provider, "key": key, "model": model, "base_url": base}
 
 
-def save_ai_config(data_dir, cfg):
+def _write_ai_file(data_dir, saved):
     """Written with mode 0600 (only the bot's own user can read it), to a temp file, then renamed."""
     os.makedirs(data_dir, exist_ok=True)
     path = os.path.join(data_dir, AI_CONFIG_FILE)
     tmp = path + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump({"provider": cfg["provider"], "key": cfg["key"], "model": cfg.get("model"),
-                   "base_url": cfg.get("base_url")}, f)
+        json.dump(saved, f)
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
+
+
+def env_ai_model():
+    """True when the AI_MODEL env variable is set (it wins over the model saved on disk)."""
+    return bool(os.environ.get("AI_MODEL", "").strip())
+
+
+def save_ai_config(data_dir, cfg):
+    _write_ai_file(data_dir, {"provider": cfg["provider"], "key": cfg["key"], "model": cfg.get("model"),
+                              "base_url": cfg.get("base_url")})
+
+
+def save_ai_model(data_dir, model):
+    """Changes only the saved model (None means the provider's default). The saved key, if any, is
+    kept as it is. An env key is never written to disk by this."""
+    saved = _read_saved_ai(data_dir)
+    saved["model"] = model
+    _write_ai_file(data_dir, saved)
 
 
 def delete_ai_config(data_dir):
@@ -1249,17 +1291,43 @@ def ai_status_line(data_dir):
     if cfg is None:
         return "🤖 AI: set nahi hai"
     where = "Render env AI_API_KEY" if os.environ.get("AI_API_KEY", "").strip() else "bot ki disk"
-    return f"🤖 AI: {AI_NAME[cfg['provider']]}, key {mask_key(cfg['key'])} ({where})"
+    return (f"🤖 AI: {AI_NAME[cfg['provider']]}, model {cfg.get('model') or AI_DEFAULT_MODEL[cfg['provider']]}, "
+            f"key {mask_key(cfg['key'])} ({where})")
+
+
+def ai_error_text(provider, code):
+    """Hinglish reason for a non-200 answer. Never contains the key or the raw provider reply."""
+    name = AI_NAME[provider]
+    if code == 401:
+        return f"Key galat ya expire/delete ho gayi hai, {name} ki site se nayi key lo."
+    if code == 402:
+        return f"{name} par credits khatam ho gaye hain. Balance top up karo, phir try karo."
+    if code == 403:
+        return f"{name} ne is key ko ye kaam karne ki permission nahi di (access ya region ki dikkat)."
+    if code == 404:
+        return f"Model naam galat hai, ya {name} par ye model available nahi hai. Model check karke dobara try karo."
+    if code == 429:
+        return f"{name} par limit khatam ho gayi ya bahut zyada requests hain. Thodi der baad ya credits check karke try karo."
+    if code == 400:
+        return f"{name} ne request sahi nahi maani (model ya settings galat ho sakti hai)."
+    if code >= 500:
+        return f"{name} ki service abhi down ya busy hai. Thodi der baad try karo."
+    return f"{name} ne jawab nahi diya (status {code})."
 
 
 def ai_request(cfg, system, user, http, max_tokens=AI_MAX_TOKENS, timeout=AI_TIMEOUT):
     """One call to the chosen provider. Returns the reply text. Raises AIError (safe text only)."""
     provider, key = cfg["provider"], cfg["key"]
     model = cfg.get("model") or AI_DEFAULT_MODEL[provider]
-    if provider == "openai":
-        base = (cfg.get("base_url") or AI_DEFAULT_BASE).rstrip("/")
+    if provider in AI_OPENAI_STYLE:
+        base = (cfg.get("base_url") or AI_OPENAI_STYLE[provider]).rstrip("/")
         url = base + "/chat/completions"
         headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
+        if provider == "openrouter":
+            headers["X-Title"] = "Bot Implementer"
+            referer = os.environ.get("AI_REFERER", "").strip()
+            if referer.lower().startswith("https://"):
+                headers["HTTP-Referer"] = referer
         body = {"model": model, "max_tokens": max_tokens,
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
     elif provider == "gemini":
@@ -1273,16 +1341,20 @@ def ai_request(cfg, system, user, http, max_tokens=AI_MAX_TOKENS, timeout=AI_TIM
         headers = {"x-api-key": key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"}
         body = {"model": model, "max_tokens": max_tokens, "system": system,
                 "messages": [{"role": "user", "content": user}]}
+    name = AI_NAME[provider]
     try:
         resp = http.post(url, headers=headers, json=body, timeout=timeout)
-    except Exception:
-        raise AIError("AI se connection nahi ho paya (time out ya network).", retry=True)
+    except Exception as e:
+        # The exception text can hold the address or headers, so only its kind is used.
+        if "timeout" in type(e).__name__.lower():
+            raise AIError(f"{name} ne time out ho gaya (jawab late aaya). Thodi der baad try karo.", retry=True)
+        raise AIError(f"{name} tak network dikkat hai, connection nahi ho paya. Net check karke try karo.", retry=True)
     code = getattr(resp, "status_code", 0)
     if code != 200:
-        raise AIError(f"AI ne jawab nahi diya (status {code}).", retry=(code == 429 or code >= 500))
+        raise AIError(ai_error_text(provider, code), retry=(code == 429 or code >= 500))
     try:
         data = resp.json()
-        if provider == "openai":
+        if provider in AI_OPENAI_STYLE:
             text = data["choices"][0]["message"]["content"]
         elif provider == "gemini":
             text = "".join(p.get("text", "") for p in data["candidates"][0]["content"]["parts"])
@@ -1296,11 +1368,11 @@ def ai_request(cfg, system, user, http, max_tokens=AI_MAX_TOKENS, timeout=AI_TIM
 
 
 def ai_check_key(cfg, http):
-    """One tiny test call. Returns None when the key works, else a safe reason."""
+    """One tiny test call (with the model in cfg). Returns None when the key and model work, else a safe reason."""
     try:
         ai_request(cfg, "Reply with the single word OK.", "Say OK.", http, max_tokens=64, timeout=30)
     except AIError as e:
-        return str(e)
+        return redact_secrets(e)
     return None
 
 
@@ -1623,6 +1695,7 @@ class Implementer:
         self.pause = pause  # seconds between animation steps (tests use 0)
         self.pending = {}  # chat_id -> (path of the saved original, display name)
         self.ai_wait = set()  # chat ids asked for the AI key: their next text is the key
+        self.ai_model_wait = set()  # chat ids asked for an AI model name: their next text is the model
         self.lock = threading.Lock()
 
     def is_owner(self, user_id):
@@ -1718,6 +1791,7 @@ class Implementer:
         chat_id = message.chat.id
         with self.lock:
             self.ai_wait.add(chat_id)
+            self.ai_model_wait.discard(chat_id)
         self.bot.send_message(chat_id, card(f"🤖 {fx_bold('AI key')}", [ai_status_line(self.data_dir)], AI_KEY_PROMPT),
                               reply_markup=option_keyboard())
 
@@ -1732,17 +1806,73 @@ class Implementer:
             pass
         provider = detect_provider(key)
         if provider is None:
-            return self.bot.send_message(chat_id, warn("Ye key pehchaan nahi aayi. OpenAI (sk-), Google Gemini (AIza) "
-                                                       "ya Anthropic (sk-ant-) ki key bhejo. Key save nahi hui."),
+            return self.bot.send_message(chat_id, warn("Ye key pehchaan nahi aayi. OpenRouter (sk-or-), Groq (gsk_), "
+                                                       "OpenAI (sk-), Google Gemini (AIza) ya Anthropic (sk-ant-) "
+                                                       "ki key bhejo. Key save nahi hui."),
                                          reply_markup=option_keyboard())
         cfg = {"provider": provider, "key": key, "model": AI_DEFAULT_MODEL[provider], "base_url": None}
         reason = ai_check_key(cfg, requests)
         if reason is not None:
-            return self.bot.send_message(chat_id, warn(f"{reason} Key save nahi hui. 'AI key set karo' dabakar dobara bhejo."),
+            return self.bot.send_message(chat_id, warn(f"{AI_NAME[provider]} pehchana. {reason} Key save nahi hui. "
+                                                       "'AI key set karo' dabakar dobara bhejo."),
                                          reply_markup=option_keyboard())
         save_ai_config(self.data_dir, cfg)
         self.bot.send_message(chat_id, card(f"✅ {fx_bold('AI key save ho gayi')}", [ai_status_line(self.data_dir)],
+                                            f"🧠 Ye {AI_NAME[provider]} ka model use hoga. Model badalna ho to "
+                                            "/aimodel likho, phir model ka naam bhejo (jaise anthropic/claude-sonnet-5.5). "
+                                            "Default wapas lene ke liye /aimodel default likho.\n"
                                             "Ye key chat me nahi dikhegi. Hatane ke liye /aiclear likho."),
+                              reply_markup=option_keyboard())
+
+    def on_aimodel(self, message):
+        """/aimodel: shows the model in use and waits for a name. /aimodel NAME sets it at once,
+        /aimodel default goes back to the provider's default. Each new name gets a test call first."""
+        chat_id = message.chat.id
+        if not self.is_owner(message.from_user.id):
+            return self.refuse(chat_id)
+        parts = (message.text or "").split(maxsplit=1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        cfg = load_ai_config(self.data_dir)
+        if cfg is None:
+            return self.bot.send_message(chat_id, warn("Pehle 'AI key set karo' se AI key daalo, phir model badal sakte ho."),
+                                         reply_markup=option_keyboard())
+        if not arg:
+            with self.lock:
+                self.ai_model_wait.add(chat_id)
+                self.ai_wait.discard(chat_id)
+            return self.bot.send_message(chat_id, card(f"🧠 {fx_bold('AI model')}", [ai_status_line(self.data_dir)],
+                                                       "Naya model ka naam bhejo (jaise anthropic/claude-sonnet-5.5). "
+                                                       "Default ke liye: default likho. Cancel karne ke liye koi menu button dabao."),
+                                         reply_markup=option_keyboard())
+        self.set_ai_model(chat_id, cfg, arg)
+
+    def on_ai_model_text(self, message):
+        chat_id = message.chat.id
+        with self.lock:
+            self.ai_model_wait.discard(chat_id)
+        self.set_ai_model(chat_id, load_ai_config(self.data_dir), (message.text or "").strip())
+
+    def set_ai_model(self, chat_id, cfg, name):
+        if cfg is None:
+            return self.bot.send_message(chat_id, warn("AI key nahi hai. Pehle 'AI key set karo' se key daalo."),
+                                         reply_markup=option_keyboard())
+        if env_ai_model():
+            return self.bot.send_message(chat_id, warn("Render me AI_MODEL env variable set hai, wo disk wali setting "
+                                                       "se pehle chalta hai. Model wahan khud badlo."),
+                                         reply_markup=option_keyboard())
+        if name.lower() == "default":
+            save_ai_model(self.data_dir, None)
+            return self.bot.send_message(chat_id, card(f"✅ {fx_bold('Model default ho gaya')}",
+                                                       [ai_status_line(self.data_dir)]), reply_markup=option_keyboard())
+        if not AI_MODEL_NAME.fullmatch(name):
+            return self.bot.send_message(chat_id, warn("Model ka naam galat lag raha hai (jaise anthropic/claude-sonnet-5.5). "
+                                                       "Purana model chal raha hai."), reply_markup=option_keyboard())
+        reason = ai_check_key(dict(cfg, model=name), requests)
+        if reason is not None:
+            return self.bot.send_message(chat_id, warn(f"{reason} Model save nahi hua, purana model chalta rahega."),
+                                         reply_markup=option_keyboard())
+        save_ai_model(self.data_dir, name)
+        self.bot.send_message(chat_id, card(f"✅ {fx_bold('Model badal gaya')}", [ai_status_line(self.data_dir)]),
                               reply_markup=option_keyboard())
 
     def on_ai_clear(self, message):
@@ -1751,6 +1881,7 @@ class Implementer:
             return self.refuse(chat_id)
         with self.lock:
             self.ai_wait.discard(chat_id)
+            self.ai_model_wait.discard(chat_id)
         removed = delete_ai_config(self.data_dir)
         text = "Bot ki disk se AI key hata di." if removed else "Bot ki disk par koi AI key nahi thi."
         if os.environ.get("AI_API_KEY", "").strip():
@@ -1767,6 +1898,11 @@ class Implementer:
                 return self.on_ai_key(message)
             with self.lock:
                 self.ai_wait.discard(chat_id)
+        if chat_id in self.ai_model_wait:
+            if raw and not raw.startswith("/") and canonical_label(raw) not in MENU_BUTTONS:
+                return self.on_ai_model_text(message)
+            with self.lock:
+                self.ai_model_wait.discard(chat_id)
         # Old labels (no emoji) map to the current ones, so both work.
         text = canonical_label(raw)
         if text.startswith("/"):
@@ -1835,6 +1971,10 @@ def register_handlers(bot, impl):
     @bot.message_handler(commands=["aiclear"])
     def _hyv_aiclear(message):
         impl.on_ai_clear(message)
+
+    @bot.message_handler(commands=["aimodel"])
+    def _hyv_aimodel(message):
+        impl.on_aimodel(message)
 
     @bot.message_handler(content_types=["document"])
     def _hyv_document(message):
