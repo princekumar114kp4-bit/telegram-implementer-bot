@@ -6,6 +6,10 @@ sends the copy back as a document. The original file is never changed.
 
 Buttons (owner only): "Status dekho" shows what the last file has; "Pichli file lo" sends the last
 updated file again. Typed /status and /last still work (quietly, no hint is shown).
+It uses no outside service and no API key. Old web server or pinger code is found and removed by a built-in
+check of the file's syntax tree. A repair pass fixes common problems (tabs, BOM, CRLF, NBSP, smart
+quotes, a hard-coded token, app.run host, missing imports) and reports every change. "/check" (or the
+words "pehle check" plus an option) shows what would change without making a file.
 
 This bot also keeps itself awake on Render: a small Flask web server ("/" and "/health" answer
 "ok") and a pinger that requests its own RENDER_EXTERNAL_URL every PING_MINUTES minutes.
@@ -17,56 +21,31 @@ Env:
   PORT            optional; web server port (Render sets it; default 10000)
   RENDER_EXTERNAL_URL  set by Render for a Web Service; the pinger calls it (skipped when unset)
   PING_MINUTES    optional; minutes between self-pings, 1 to 60 (default 5)
-  AI_API_KEY      optional; AI key used only when the Database Export/Import option needs AI
-  AI_PROVIDER     optional; openai, openrouter, groq, gemini or anthropic (default: from the key prefix)
-  AI_MODEL        optional; model name, overrides the model saved with /aimodel
-  AI_BASE_URL     optional; API base address for an OpenAI-compatible provider
-  AI_REFERER      optional; sent as HTTP-Referer to OpenRouter (not sent when unset)
   HYV_ADMIN_IDS   optional; extra Telegram ids (comma separated) allowed to use Database Export/Import
                   in a bot that gets the feature added
 """
 
 import ast
-import difflib
-import json
 import logging
+import io
 import os
 import re
 import sys
 import time
 import threading
 
-import requests
 import telebot
 from telebot import types
 from telebot.apihelper import ApiException
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# Biggest .py file the bot takes. Default 1 MB. Set AI_MAX_FILE_KB in the environment to change it.
-# Telegram lets a bot download at most 20 MB, so the value is capped there.
-AI_MAX_FILE_KB_DEFAULT = 1024
-AI_MAX_FILE_KB_MIN = 20
-AI_MAX_FILE_KB_CAP = 20 * 1024
-
-
-def _ai_file_kb(raw):
-    """AI_MAX_FILE_KB from the environment text: a whole number, kept between the min and the cap."""
-    try:
-        kb = int(str(raw).strip()) if str(raw or "").strip() else AI_MAX_FILE_KB_DEFAULT
-    except ValueError:
-        kb = AI_MAX_FILE_KB_DEFAULT
-    return max(AI_MAX_FILE_KB_MIN, min(kb, AI_MAX_FILE_KB_CAP))
-
-
-AI_MAX_FILE_KB = _ai_file_kb(os.environ.get("AI_MAX_FILE_KB", ""))
-AI_MAX_BYTES = AI_MAX_FILE_KB * 1024
-MAX_BYTES = AI_MAX_BYTES                 # the same limit for every option (the file must be uploaded first)
+# Biggest .py file the bot takes (Telegram lets a bot download at most 20 MB).
+MAX_BYTES = 20 * 1024 * 1024
 
 
 def size_limit_text():
     """Plain Hinglish limit, for messages."""
-    kb = AI_MAX_FILE_KB
-    return f"{kb // 1024} MB" if kb % 1024 == 0 else f"{kb} KB"
+    return f"{MAX_BYTES // (1024 * 1024)} MB"
 
 
 BTN_WEB = "🌐 Web server add karo"
@@ -76,9 +55,10 @@ BTN_DB = "🗄 Database Export/Import"   # owner/admin only backup feature
 OPTIONS = (BTN_WEB, BTN_PINGER, BTN_BOTH, BTN_DB)
 BTN_STATUS = "📊 Status dekho"   # same as the typed /status
 BTN_LAST = "🔁 Pichli file lo"   # same as the typed /last
-BTN_AI = "🤖 AI key set karo"   # owner only: saves the AI key (needed only by the backup option)
-MENU_BUTTONS = OPTIONS + (BTN_STATUS, BTN_LAST, BTN_AI)
+MENU_BUTTONS = OPTIONS + (BTN_STATUS, BTN_LAST)
 INFO_BUTTONS = (BTN_STATUS, BTN_LAST)
+CHECK_WORDS = {"web": BTN_WEB, "pinger": BTN_PINGER, "both": BTN_BOTH, "dono": BTN_BOTH,
+               "db": BTN_DB, "database": BTN_DB}
 # Labels from before the emoji were added. A tap with an old label still works.
 LEGACY_LABELS = {"Web server add karo": BTN_WEB, "Pinger add karo": BTN_PINGER,
                  "Dono add karo": BTN_BOTH, "Status dekho": BTN_STATUS, "Pichli file lo": BTN_LAST}
@@ -90,7 +70,7 @@ RESULT_NOTE = "ℹ️ Ye naya file hai. Ise Render par khud dobara deploy karna 
 # "danger", "success", "primary" on reply keyboard buttons). The three options are blue, the two
 # info buttons are green. The label text does not change.
 BUTTON_STYLE = {BTN_WEB: "primary", BTN_PINGER: "primary", BTN_BOTH: "primary", BTN_DB: "primary",
-                BTN_STATUS: "success", BTN_LAST: "success", BTN_AI: "primary"}
+                BTN_STATUS: "success", BTN_LAST: "success"}
 
 RULE = "━━━━━━━━━━━━━━"
 
@@ -143,9 +123,9 @@ WELCOME = (f"👋 {fx_bold('Namaste!')} Main Bot Implementer hoon.\n"
            f"{RULE}\n"
            "📎 Apni bot ki .py file bhejo.\n"
            "➕ Main web server aur/ya pinger add karke ek NAYI file bhejunga.\n"
-           "AI key set hone par purana web/pinger code hata ke naya daalta hai.\n"
+           "🔁 Purana web server ya pinger ho to use hata ke naya daalta hai (apne aap, bahar kisi service ke bina).\n"
            "🔒 Aapki original file main nahi chhedunga.\n"
-           f"📏 File ki limit {size_limit_text()} hai. Badi file me AI sirf zaroori hisse dekhta hai.\n\n"
+           f"📏 File ki limit {size_limit_text()} hai.\n\n"
            f"🧭 {fx_script('Options')}\n"
            "File bhejne ke baad neeche ke option chuno:\n"
            f"{BTN_WEB}\n"
@@ -155,7 +135,8 @@ WELCOME = (f"👋 {fx_bold('Namaste!')} Main Bot Implementer hoon.\n"
            f"⚡ {fx_small('Quick buttons')}\n"
            "Kabhi bhi neeche ke buttons se:\n"
            f"{BTN_STATUS}: file me kya pehle se hai\n"
-           f"{BTN_LAST}: pichli updated file dobara")
+           f"{BTN_LAST}: pichli updated file dobara\n\n"
+           "🔍 /check likho (ya 'pehle check web' jaisa) to bina file banaye dekh lo ki kya badlega.")
 STATUS_TEXT = {
     "sure": "✅ pehle se hai",
     "unsure": "❔ shayad hai (pakka nahi)",
@@ -245,6 +226,7 @@ except Exception:
 
 BACKUP_TELEBOT = r'''# >>> hyv-injected:backup (added by the implementer bot: owner/admin Export and Import of data files)
 import hashlib as _hyv_bk_hash
+import inspect as _hyv_bk_inspect
 import json as _hyv_bk_json
 import os as _hyv_bk_os
 import re as _hyv_bk_re
@@ -266,6 +248,9 @@ _HYV_BK_CODE_PATH = _hyv_bk_re.compile(r"""["']([^"'\s]+\.(?:db|sqlite3?|json|cs
 _HYV_BK_BTN_EXPORT = "📤 Export"
 _HYV_BK_BTN_IMPORT = "📥 Import"
 _HYV_BK_BTN_BACK = "🔙 Back"
+_HYV_BK_BTN_DB = "🗄 Database Export/Import"   # the button the admin taps to open the backup menu
+_HYV_BK_DB_LABELS = (_HYV_BK_BTN_DB, _HYV_BK_BTN_EXPORT, _HYV_BK_BTN_IMPORT)
+_HYV_BK_BTN_STYLE = "primary"   # colour of the Database button (blue), same as the bot's option buttons
 _hyv_bk_pending = {}   # admin user id -> "import" or staged restore info
 
 
@@ -419,7 +404,64 @@ def _hyv_bk_bar(done, total=5):
     return "▰" * done + "▱" * (total - done)
 
 
+def _hyv_bk_admin_chat(chat_id):
+    """True when the chat is the private chat of an admin (in a private chat chat_id is the user id)."""
+    return chat_id is not None and not isinstance(chat_id, bool) and _hyv_bk_is_admin(chat_id)
+
+
+def _hyv_bk_btn(label):
+    """The Database button as the dict telebot keeps in a keyboard row, with its colour (style). A telebot version
+    whose KeyboardButton does not take style gets the style added to the dict, so it still reaches Telegram."""
+    try:
+        return _hyv_bk_types.KeyboardButton(label, style=_HYV_BK_BTN_STYLE).to_dict()
+    except TypeError:
+        btn = _hyv_bk_types.KeyboardButton(label).to_dict()
+        btn["style"] = _HYV_BK_BTN_STYLE
+        return btn
+
+
+def _hyv_bk_tb_markup(markup):
+    """The same reply keyboard with the Database button in one extra last row. The original object is not changed."""
+    if not isinstance(markup, _hyv_bk_types.ReplyKeyboardMarkup):
+        return markup
+    rows = [list(row) for row in (markup.keyboard or [])]
+    texts = [b.get("text") if isinstance(b, dict) else getattr(b, "text", b) for row in rows for b in row]
+    if any(t in _HYV_BK_DB_LABELS for t in texts):
+        return markup
+    rows.append([_hyv_bk_btn(_HYV_BK_BTN_DB)])
+    return _hyv_bk_types.ReplyKeyboardMarkup(
+        resize_keyboard=markup.resize_keyboard, one_time_keyboard=markup.one_time_keyboard,
+        selective=markup.selective, row_width=markup.row_width,
+        input_field_placeholder=markup.input_field_placeholder, is_persistent=markup.is_persistent, keyboard=rows)
+
+
+def _hyv_bk_tb_wrap(fn, sig):
+    def send(*args, **kwargs):
+        try:
+            bound = sig.bind_partial(*args, **kwargs)
+        except TypeError:
+            return fn(*args, **kwargs)
+        if _hyv_bk_admin_chat(bound.arguments.get("chat_id")) and bound.arguments.get("reply_markup") is not None:
+            bound.arguments["reply_markup"] = _hyv_bk_tb_markup(bound.arguments["reply_markup"])
+        return fn(*bound.args, **bound.kwargs)
+    send.__name__ = fn.__name__
+    return send
+
+
+def _hyv_bk_patch_telebot(bot):
+    """pyTelegramBotAPI: the send_* methods of this bot object that take a reply keyboard add the Database row
+    when the chat is an admin's private chat."""
+    for name in dir(type(bot)):
+        fn = getattr(bot, name, None) if name.startswith("send_") else None
+        if fn is None or not callable(fn):
+            continue
+        sig = _hyv_bk_inspect.signature(fn)
+        if "reply_markup" in sig.parameters:
+            setattr(bot, name, _hyv_bk_tb_wrap(fn, sig))
+
+
 def _hyv_bk_register(bot):
+    _hyv_bk_patch_telebot(bot)
     def admin_private(m):
         return m.chat.type == "private" and _hyv_bk_is_admin(m.from_user.id)
 
@@ -543,7 +585,7 @@ def _hyv_bk_register(bot):
 
     before_m = len(bot.message_handlers)
     before_c = len(bot.callback_query_handlers)
-    bot.message_handler(func=lambda m: admin_private(m) and m.text in ("/backup", "/hyvbackup"))(show_menu)
+    bot.message_handler(func=lambda m: admin_private(m) and m.text in ("/backup", "/hyvbackup", _HYV_BK_BTN_DB))(show_menu)
     bot.message_handler(func=lambda m: admin_private(m) and m.text == _HYV_BK_BTN_EXPORT)(export)
     bot.message_handler(func=lambda m: admin_private(m) and m.text == _HYV_BK_BTN_IMPORT)(start_import)
     bot.message_handler(func=lambda m: admin_private(m) and m.text == _HYV_BK_BTN_BACK)(back)
@@ -570,6 +612,7 @@ from telegram.ext import ApplicationHandlerStop as _hyv_bk_Stop
 from telegram.ext import CallbackQueryHandler as _hyv_bk_CQH, MessageHandler as _hyv_bk_MH
 from telegram.ext import filters as _hyv_bk_filters
 import hashlib as _hyv_bk_hash
+import inspect as _hyv_bk_inspect
 import json as _hyv_bk_json
 import os as _hyv_bk_os
 import re as _hyv_bk_re
@@ -590,6 +633,9 @@ _HYV_BK_CODE_PATH = _hyv_bk_re.compile(r"""["']([^"'\s]+\.(?:db|sqlite3?|json|cs
 _HYV_BK_BTN_EXPORT = "📤 Export"
 _HYV_BK_BTN_IMPORT = "📥 Import"
 _HYV_BK_BTN_BACK = "🔙 Back"
+_HYV_BK_BTN_DB = "🗄 Database Export/Import"   # the button the admin taps to open the backup menu
+_HYV_BK_DB_LABELS = (_HYV_BK_BTN_DB, _HYV_BK_BTN_EXPORT, _HYV_BK_BTN_IMPORT)
+_HYV_BK_BTN_STYLE = "primary"   # colour of the Database button (blue), same as the bot's option buttons
 _hyv_bk_pending = {}   # admin user id -> "import" or staged restore info
 
 
@@ -747,7 +793,71 @@ async def _hyv_bk_async_run(fn, *args):
     return await asyncio.to_thread(fn, *args)
 
 
+def _hyv_bk_admin_chat(chat_id):
+    """True when the chat is the private chat of an admin (in a private chat chat_id is the user id)."""
+    return chat_id is not None and not isinstance(chat_id, bool) and _hyv_bk_is_admin(chat_id)
+
+
+def _hyv_bk_btn(label):
+    """The Database button with its colour (style). A python-telegram-bot version without the style field
+    gets it in api_kwargs (sent to Telegram as it is); if that fails too, a plain button."""
+    try:
+        return _hyv_bk_KB(label, style=_HYV_BK_BTN_STYLE)
+    except TypeError:
+        pass
+    try:
+        return _hyv_bk_KB(label, api_kwargs={"style": _HYV_BK_BTN_STYLE})
+    except TypeError:
+        return _hyv_bk_KB(label)
+
+
+def _hyv_bk_db_markup(markup):
+    """The same reply keyboard with the Database button in one extra last row. The original object is not changed."""
+    if not isinstance(markup, _hyv_bk_RKM):
+        return markup
+    rows = [list(row) for row in markup.keyboard]
+    texts = [getattr(b, "text", b) for row in rows for b in row]
+    if any(t in _HYV_BK_DB_LABELS for t in texts):
+        return markup
+    rows.append([_hyv_bk_btn(_HYV_BK_BTN_DB)])
+    extra = {"is_persistent": markup.is_persistent} if hasattr(markup, "is_persistent") else {}
+    return _hyv_bk_RKM(rows, resize_keyboard=markup.resize_keyboard, one_time_keyboard=markup.one_time_keyboard,
+                       selective=markup.selective, input_field_placeholder=markup.input_field_placeholder, **extra)
+
+
+def _hyv_bk_ptb_wrap(fn, sig):
+    async def send(self, *args, **kwargs):
+        try:
+            bound = sig.bind_partial(self, *args, **kwargs)
+        except TypeError:
+            return await fn(self, *args, **kwargs)
+        if _hyv_bk_admin_chat(bound.arguments.get("chat_id")) and bound.arguments.get("reply_markup") is not None:
+            bound.arguments["reply_markup"] = _hyv_bk_db_markup(bound.arguments["reply_markup"])
+        return await fn(*bound.args, **bound.kwargs)
+    send.__name__ = fn.__name__
+    send.__qualname__ = fn.__qualname__
+    return send
+
+
+def _hyv_bk_patch_ptb_bot(bot):
+    """python-telegram-bot: the bot object gets a subclass (same name, no new fields) whose send_* methods
+    that take a reply keyboard add the Database row when the chat is an admin's private chat."""
+    base = type(bot)
+    if getattr(base, "_hyv_bk_patched", False):
+        return
+    ns = {"__slots__": (), "_hyv_bk_patched": True}
+    for name in dir(base):
+        fn = getattr(base, name, None)
+        if not name.startswith("send_") or not _hyv_bk_inspect.isfunction(fn):
+            continue
+        sig = _hyv_bk_inspect.signature(fn)
+        if "reply_markup" in sig.parameters:
+            ns[name] = _hyv_bk_ptb_wrap(fn, sig)
+    bot.__class__ = type(base.__name__, (base,), ns)
+
+
 def _hyv_bk_register(app):
+    _hyv_bk_patch_ptb_bot(app.bot)
     def is_admin(update):
         chat = update.effective_chat
         user = update.effective_user
@@ -846,7 +956,7 @@ def _hyv_bk_register(app):
         if not is_admin(update):
             return
         text = update.effective_message.text or ""
-        if text in ("/backup", "/hyvbackup"):
+        if text in ("/backup", "/hyvbackup", _HYV_BK_BTN_DB):
             await show_menu(update, context)
         elif text == _HYV_BK_BTN_EXPORT:
             await export(update, context)
@@ -916,6 +1026,7 @@ WEB_SURE = [
     r"HTTPServer\b|\bserve_forever\s*\(",                        # stdlib http server (also ThreadingHTTPServer)
     r"\bstart_web\s*\(",                                         # keep_alive.start_web() style
     r"\.run\([^)]*0\.0\.0\.0",                                   # app.run(host="0.0.0.0", ...)
+    r"\bweb\.(?:run_app|Application|AppRunner|TCPSite)\b",       # aiohttp server calls
 ]
 WEB_UNSURE = [
     r"0\.0\.0\.0",                                               # bind-all address somewhere
@@ -936,6 +1047,35 @@ PINGER_UNSURE = [
 PERIODIC_THREAD = r"\bThread\s*\(|\.Thread\s*\("
 PERIODIC_SLEEP = r"\bsleep\s*\("
 PERIODIC_HTTP = r"\brequests\.(?:get|head|post)\s*\(|\burlopen\s*\(|\bhttpx\.\w+\s*\(|\baiohttp\b"
+
+
+OWN_URL = re.compile(r"localhost|127\.0\.0\.1|RENDER_EXTERNAL_URL|PING_URL|SELF_URL|0\.0\.0\.0", re.I)
+
+
+def _loop_pinger(node, text):
+    """A def that pings its own address on a timer: a while True loop with a sleep, or a def that
+    schedules itself again with threading.Timer. Both must make a web request to the bot's own address
+    (localhost, 127.0.0.1, RENDER_EXTERNAL_URL, ...). Other periodic web requests are not pingers."""
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    if not (re.search(PERIODIC_HTTP, text) and OWN_URL.search(text)):
+        return False
+    forever = any(isinstance(c, ast.While) and isinstance(c.test, ast.Constant) and c.test.value is True
+                  for c in ast.walk(node))
+    rescheduled = any(isinstance(c, ast.Call) and _call_name(c) == "Timer"
+                      and any(isinstance(a, ast.Name) and a.id == node.name for a in c.args)
+                      for c in ast.walk(node))
+    return (forever and bool(re.search(PERIODIC_SLEEP, text))) or rescheduled
+
+
+def _has_loop_pinger(source):
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return False
+    lines = source.splitlines()
+    return any(_loop_pinger(n, "\n".join(lines[_span(n)[0] - 1:n.end_lineno]))
+               for n in ast.walk(tree) if isinstance(n, DEF_KINDS))
 
 
 def _any(patterns, source, flags):
@@ -965,7 +1105,7 @@ def pinger_status(source):
     "unsure" when only these show up: the word pinger or ping on its own, or a background thread that
     sleeps and makes a web request (a periodic request job).
     """
-    if _any(PINGER_SURE, source, re.I | re.M):
+    if _any(PINGER_SURE, source, re.I | re.M) or _has_loop_pinger(source):
         return "sure"
     if _any(PINGER_UNSURE, source, re.I | re.M):
         return "unsure"
@@ -1030,13 +1170,6 @@ def read_source(data):
 
 
 # ---- The option logic (no Telegram calls: easy to test) ------------------------------
-
-def _skip_phrase(kind, status):
-    name = "Web server" if kind == "web" else "Pinger"
-    if status == "sure":
-        return f"{name} ka code pehle se hai"
-    return f"{name} jaisa code lagta hai (pakka nahi)"
-
 
 BACKUP_MARK = "hyv-injected:backup"
 
@@ -1128,7 +1261,6 @@ def inject_backup(source, lib, admin_id):
     ours = [n for n in new_tree.body if first <= n.lineno <= last]
     reg_dump = ast.dump(ast.parse(reg_line.strip()).body[0])
     regs = [n for n in ast.walk(new_tree) if isinstance(n, ast.Expr) and ast.dump(n) == reg_dump]
-    rest = [n for n in new_tree.body if not (first <= n.lineno <= last)]
     stripped = _HypStrip(reg_dump).visit(ast.parse(new_source))
     stripped.body = [n for n in stripped.body if not (first <= n.lineno <= last)]
     same = ast.dump(stripped) == ast.dump(ast.parse(source)) or ast.dump(
@@ -1141,711 +1273,80 @@ def inject_backup(source, lib, admin_id):
 
 def backup_done_text(admin_id, extra=""):
     text = (f"Database Export/Import add kar diya. Admin ID {admin_id} (jisne file bheji) ko hi button dikhega. "
+            "Button har reply keyboard me runtime se judta hai, isliye bot ke kisi bhi menu me neeche dikhega. "
             "Extra admin ke liye Render me HYV_ADMIN_IDS env variable me comma se ID daal sakte ho. "
             "Naya file Render par deploy karke bot restart karna.")
     return f"{text} {extra}".strip()
 
 
-def plan_backup(source, admin_id=None, ai_cfg=None, http=None):
+def _backup_strip(source):
+    """The source without the injected block and its register line (the exact reverse of inject_backup),
+    or None when the source has no block. Used to replace an older block with the current template."""
+    m = re.search(r"^# >>> hyv-injected:backup\b[^\n]*\n", source, re.M)
+    if m is None:
+        return None
+    e = re.search(r"^# <<< hyv-injected:backup\b[^\n]*(\n|$)", source[m.start():], re.M)
+    if e is None:
+        return None
+    start, end = m.start(), m.start() + e.end()
+    head, tail = source[:start], source[end:]
+    if head.endswith("\n\n"):      # the blank line inserted before the block
+        head = head[:-1]
+    if tail.startswith("\n"):       # the blank line inserted after the block
+        tail = tail[1:]
+    out = head + tail
+    return re.sub(r"^[ \t]*_hyv_bk_register\(\w+\)[ \t]*# hyv-injected:backup-register[ \t]*\n", "", out, flags=re.M)
+
+
+def plan_backup(source, admin_id=None):
     """Returns (new_source, reply_text) for the Database Export/Import option.
-    The telebot and python-telegram-bot templates come first. The AI is used only when the library is
-    not supported or the bot object is not found, and an AI key is set. admin_id is the Telegram id of
-    the member who sent the file; it is written into the injected code."""
-    if BACKUP_MARK in source:
-        return None, "Database Export/Import pehle se is file mein hai. Isliye maine kuch add nahi kiya."
+    Only the built-in templates are used: pyTelegramBotAPI (telebot) and python-telegram-bot.
+    admin_id is the Telegram id of the member who sent the file; it is written into the injected code."""
+    already = "Database Export/Import pehle se is file mein hai. Isliye maine kuch add nahi kiya."
     if not isinstance(admin_id, int) or isinstance(admin_id, bool) or admin_id <= 0:
         return None, ("File bhejne wale ka Telegram ID nahi mila, isliye Database Export/Import nahi jod paya. "
                       "File waisi hi rahegi.")
-    lib = backup_library(source)
-    if lib is not None:
+    if BACKUP_MARK in source:
+        # An older block from an earlier version is swapped for the current template. An identical one is left alone.
+        stripped = _backup_strip(source)
+        lib = backup_library(stripped) if stripped is not None else None
+        if stripped is None or lib is None:
+            return None, already
         try:
-            return inject_backup(source, lib, admin_id), backup_done_text(admin_id)
+            new_source = inject_backup(stripped, lib, admin_id)
         except ValueError:
-            reason = "Is file mein bot ka main object nahi mila"
-    else:
-        reason = ("Ye bot library abhi support nahi hai (templates sirf pyTelegramBotAPI "
-                  "aur python-telegram-bot ke liye hain)")
-    if ai_cfg is None:
-        return None, (f"{reason}. AI key bhi set nahi hai. '{BTN_AI}' se key daal kar dobara try karo. "
-                      "File waisi hi rahegi.")
-    new_source, err = ai_inject_backup(source, admin_id, ai_cfg, http, lib)
-    if new_source is None:
-        return None, f"{err} File waisi hi rahegi."
-    return new_source, backup_done_text(
-        admin_id, "AI ne ye code banaya hai, isliye Render par deploy karke pehle ek baar test karna.")
-
-
-# ---- AI (optional). The owner adds an API key with the AI button. The key is never printed,
-# logged or echoed back. It is kept in a 0600 file in the data folder, or read from AI_API_KEY.
-
-AI_PROVIDERS = ("openai", "gemini", "anthropic", "openrouter", "groq")
-AI_NAME = {"openai": "OpenAI", "gemini": "Google Gemini", "anthropic": "Anthropic Claude",
-           "openrouter": "OpenRouter", "groq": "Groq"}
-AI_DEFAULT_MODEL = {"openai": "gpt-4o-mini", "gemini": "gemini-2.0-flash", "anthropic": "claude-3-5-haiku-latest",
-                    "openrouter": "anthropic/claude-sonnet-5.5", "groq": "llama-3.3-70b-versatile"}
-# OpenAI-style providers (chat/completions with a Bearer key). Only the address differs.
-AI_OPENAI_STYLE = {"openai": "https://api.openai.com/v1", "openrouter": "https://openrouter.ai/api/v1",
-                   "groq": "https://api.groq.com/openai/v1"}
-AI_DEFAULT_BASE = AI_OPENAI_STYLE["openai"]
-AI_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/+-]{0,119}")
-AI_CONFIG_FILE = "ai_config.json"
-AI_TIMEOUT = 120          # seconds per call (a big prompt can take a while)
-AI_TRIES = 3              # first try plus 2 retries
-AI_MAX_TOKENS = 8192      # answer size asked from the AI (every provider we use accepts this)
-AI_OUT_CAP = {"openai": 16384, "openrouter": 8192, "groq": 8192, "gemini": 8192, "anthropic": 8192}
-AI_FULL_REMOVE_MAX = 30 * 1024   # replace path: up to this size the whole file is sent (old way)
-AI_FULL_BACKUP_MAX = 20 * 1024   # backup path: up to this size the AI writes the whole file back
-AI_CHARS_PER_TOKEN = 3.5         # rough token estimate used for the prompt budget
-AI_PROMPT_TOKENS = 14000         # the whole prompt sent to the AI must stay under this
-AI_PROMPT_CHARS = int(AI_PROMPT_TOKENS * AI_CHARS_PER_TOKEN)
-AI_VIEW_MIN_ROOM = 4000          # chars that must stay free for code regions after the outline
-AI_OUT_MAX = 400 * 1024   # the AI answer must be this small
-AI_KEY_PROMPT = "Ab apni API key bhejo. Ye message main turant delete kar dunga, aur key kisi ko nahi dikhaunga."
-# Hosts the code this bot injects may call. The AI provider hosts (AI_OPENAI_STYLE, Gemini, Anthropic)
-# are NOT here: they are used only by this bot's own AI calls, never by a member's injected code.
-AI_ALLOWED_HOSTS = ("api.telegram.org", "localhost", "127.0.0.1")
-# Token and key shapes. sk-or-v1-... (OpenRouter) is listed on its own, the generic sk- rule covers it too.
-AI_SECRET = re.compile(r"\d{8,12}:[A-Za-z0-9_-]{30,}|sk-or-[A-Za-z0-9_-]{16,}|sk-[A-Za-z0-9_-]{16,}"
-                       r"|gsk_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{30,}")
-AI_BAD_CALLS = re.compile(r"\b(os\.system|subprocess|eval\s*\(|exec\s*\(|__import__|pickle\.loads)")
-AI_BAD_IMPORTS = re.compile(r"^\s*(import|from)\s+(socket|urllib|http\.client|httpx|aiohttp|requests)\b", re.M)
-AI_URL_HOST = re.compile(r"https?://([^/\s\"'):]+)", re.I)
-AI_SYSTEM = ("You edit one Python Telegram bot file for its owner. Reply with the complete updated file inside "
-             "one ```python block and nothing else.")
-
-
-class AIError(Exception):
-    """A safe message for the owner. Never contains the key or the raw provider reply."""
-
-    def __init__(self, text, retry=False):
-        super().__init__(text)
-        self.retry = retry
-
-
-def mask_key(key):
-    """Only the first 4 and the last 4 characters."""
-    if not key or len(key) < 12:
-        return "****"
-    return f"{key[:4]}...{key[-4:]}"
-
-
-def detect_provider(key):
-    """Provider from the key prefix. The order matters: sk-ant- and sk-or- are checked before the
-    generic sk- (OpenAI) rule, otherwise an OpenRouter key would be sent to OpenAI."""
-    if key.startswith("sk-ant-"):
-        return "anthropic"
-    if key.startswith("sk-or-"):
-        return "openrouter"
-    if key.startswith("gsk_"):
-        return "groq"
-    if key.startswith("AIza"):
-        return "gemini"
-    if key.startswith("sk-"):
-        return "openai"
-    return None
-
-
-def redact_secrets(text):
-    """Any token or key shape in a text is replaced before the text is shown or logged."""
-    return AI_SECRET.sub("<hidden>", str(text))
-
-
-def _read_saved_ai(data_dir):
+            return None, "Database Export/Import ka purana code badalne mein dikkat aayi. File waisi hi rahegi."
+        if new_source == source:
+            return None, already
+        return new_source, ("Database Export/Import ka purana code naye version se badal diya. "
+                            "Admin ID %d ko button dikhega. Button har reply keyboard me runtime se judta hai, sirf admin ke liye. "
+                            "Naya file Render par deploy karke bot restart karna." % admin_id)
+    lib = backup_library(source)
+    if lib is None:
+        return None, ("Ye bot library abhi support nahi hai (Database Export/Import sirf pyTelegramBotAPI "
+                      "aur python-telegram-bot ke liye hai). File waisi hi rahegi.")
     try:
-        with open(os.path.join(data_dir, AI_CONFIG_FILE), "r", encoding="utf-8") as f:
-            loaded = json.load(f)
-        return loaded if isinstance(loaded, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def load_ai_config(data_dir):
-    """The AI settings in use, or None. Env vars (AI_API_KEY, AI_PROVIDER, AI_MODEL, AI_BASE_URL)
-    win over the saved file. Returns a dict with provider, key, model and base_url."""
-    saved = _read_saved_ai(data_dir)
-    env_key = os.environ.get("AI_API_KEY", "").strip()
-    key = env_key or str(saved.get("key") or "").strip()
-    if not key:
-        return None
-    env_provider = os.environ.get("AI_PROVIDER", "").strip().lower()
-    provider = env_provider if env_provider in AI_PROVIDERS else ""
-    if not provider and not env_key and saved.get("provider") in AI_PROVIDERS:
-        provider = saved["provider"]
-    if not provider:
-        provider = detect_provider(key) or ""
-    if provider not in AI_PROVIDERS:
-        return None
-    model = os.environ.get("AI_MODEL", "").strip() or str(saved.get("model") or "") or AI_DEFAULT_MODEL[provider]
-    base = os.environ.get("AI_BASE_URL", "").strip() or saved.get("base_url") or None
-    return {"provider": provider, "key": key, "model": model, "base_url": base}
-
-
-def _write_ai_file(data_dir, saved):
-    """Written with mode 0600 (only the bot's own user can read it), to a temp file, then renamed."""
-    os.makedirs(data_dir, exist_ok=True)
-    path = os.path.join(data_dir, AI_CONFIG_FILE)
-    tmp = path + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(saved, f)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
-
-
-def env_ai_model():
-    """True when the AI_MODEL env variable is set (it wins over the model saved on disk)."""
-    return bool(os.environ.get("AI_MODEL", "").strip())
-
-
-def save_ai_config(data_dir, cfg):
-    _write_ai_file(data_dir, {"provider": cfg["provider"], "key": cfg["key"], "model": cfg.get("model"),
-                              "base_url": cfg.get("base_url")})
-
-
-def save_ai_model(data_dir, model):
-    """Changes only the saved model (None means the provider's default). The saved key, if any, is
-    kept as it is. An env key is never written to disk by this."""
-    saved = _read_saved_ai(data_dir)
-    saved["model"] = model
-    _write_ai_file(data_dir, saved)
-
-
-def delete_ai_config(data_dir):
-    """True when a saved key file was removed."""
-    try:
-        os.remove(os.path.join(data_dir, AI_CONFIG_FILE))
-        return True
-    except OSError:
-        return False
-
-
-def ai_status_line(data_dir):
-    cfg = load_ai_config(data_dir)
-    if cfg is None:
-        return "🤖 AI: set nahi hai"
-    where = "Render env AI_API_KEY" if os.environ.get("AI_API_KEY", "").strip() else "bot ki disk"
-    return (f"🤖 AI: {AI_NAME[cfg['provider']]}, model {cfg.get('model') or AI_DEFAULT_MODEL[cfg['provider']]}, "
-            f"key {mask_key(cfg['key'])} ({where})")
-
-
-def ai_error_text(provider, code):
-    """Hinglish reason for a non-200 answer. Never contains the key or the raw provider reply."""
-    name = AI_NAME[provider]
-    if code == 401:
-        return f"Key galat ya expire/delete ho gayi hai, {name} ki site se nayi key lo."
-    if code == 402:
-        return f"{name} par credits khatam ho gaye hain. Balance top up karo, phir try karo."
-    if code == 403:
-        return f"{name} ne is key ko ye kaam karne ki permission nahi di (access ya region ki dikkat)."
-    if code == 404:
-        return f"Model naam galat hai, ya {name} par ye model available nahi hai. Model check karke dobara try karo."
-    if code == 429:
-        return f"{name} par limit khatam ho gayi ya bahut zyada requests hain. Thodi der baad ya credits check karke try karo."
-    if code == 400:
-        return f"{name} ne request sahi nahi maani (model ya settings galat ho sakti hai)."
-    if code >= 500:
-        return f"{name} ki service abhi down ya busy hai. Thodi der baad try karo."
-    return f"{name} ne jawab nahi diya (status {code})."
-
-
-def ai_request(cfg, system, user, http, max_tokens=AI_MAX_TOKENS, timeout=AI_TIMEOUT):
-    """One call to the chosen provider. Returns the reply text. Raises AIError (safe text only)."""
-    provider, key = cfg["provider"], cfg["key"]
-    model = cfg.get("model") or AI_DEFAULT_MODEL[provider]
-    max_tokens = min(max_tokens, AI_OUT_CAP.get(provider, AI_MAX_TOKENS))   # never ask above a provider's cap
-    if provider in AI_OPENAI_STYLE:
-        base = (cfg.get("base_url") or AI_OPENAI_STYLE[provider]).rstrip("/")
-        url = base + "/chat/completions"
-        headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
-        if provider == "openrouter":
-            headers["X-Title"] = "Bot Implementer"
-            referer = os.environ.get("AI_REFERER", "").strip()
-            if referer.lower().startswith("https://"):
-                headers["HTTP-Referer"] = referer
-        body = {"model": model, "max_tokens": max_tokens,
-                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
-    elif provider == "gemini":
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
-        body = {"systemInstruction": {"parts": [{"text": system}]},
-                "contents": [{"role": "user", "parts": [{"text": user}]}],
-                "generationConfig": {"maxOutputTokens": max_tokens}}
-    else:
-        url = "https://api.anthropic.com/v1/messages"
-        headers = {"x-api-key": key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"}
-        body = {"model": model, "max_tokens": max_tokens, "system": system,
-                "messages": [{"role": "user", "content": user}]}
-    name = AI_NAME[provider]
-    try:
-        resp = http.post(url, headers=headers, json=body, timeout=timeout)
-    except Exception as e:
-        # The exception text can hold the address or headers, so only its kind is used.
-        if "timeout" in type(e).__name__.lower():
-            raise AIError(f"{name} ne time out ho gaya (jawab late aaya). Thodi der baad try karo.", retry=True)
-        raise AIError(f"{name} tak network dikkat hai, connection nahi ho paya. Net check karke try karo.", retry=True)
-    code = getattr(resp, "status_code", 0)
-    if code != 200:
-        raise AIError(ai_error_text(provider, code), retry=(code == 429 or code >= 500))
-    try:
-        data = resp.json()
-        if provider in AI_OPENAI_STYLE:
-            choice = data["choices"][0]
-            text = choice["message"]["content"]
-            cut = choice.get("finish_reason") == "length"
-        elif provider == "gemini":
-            cand = data["candidates"][0]
-            text = "".join(p.get("text", "") for p in cand["content"]["parts"])
-            cut = cand.get("finishReason") == "MAX_TOKENS"
-        else:
-            text = "".join(b.get("text", "") for b in data["content"] if b.get("type") == "text")
-            cut = data.get("stop_reason") == "max_tokens"
-    except (KeyError, IndexError, TypeError, ValueError, AttributeError):
-        raise AIError("AI ka jawab samajh nahi aaya.", retry=True)
-    if cut:
-        # A cut-off answer is not retried: the same request would be cut off again.
-        raise AIError("AI ka jawab beech me kat gaya (wo bahut lamba ho gaya). Isliye kuch nahi badla.", retry=False)
-    if not isinstance(text, str) or not text.strip():
-        raise AIError("AI ne khaali jawab diya.", retry=True)
-    return text
-
-
-def ai_check_key(cfg, http):
-    """One tiny test call (with the model in cfg). Returns None when the key and model work, else a safe reason."""
-    try:
-        ai_request(cfg, "Reply with the single word OK.", "Say OK.", http, max_tokens=64, timeout=30)
-    except AIError as e:
-        return redact_secrets(e)
-    return None
-
-
-def extract_code(reply):
-    m = re.search(r"```[ \t]*(?:python|py)?[ \t]*\n(.*?)```", reply, re.S | re.I)
-    return (m.group(1) if m else reply).strip("\n") + "\n"
-
-
-def check_ai_output(original, new, admin_id):
-    """None when the AI's file is acceptable, else a Hinglish reason. It must compile, carry the markers
-    and the admin id, keep every original function and class, change only a few original lines, and add
-    no secret, no unknown web address and no dangerous call."""
-    if not new.strip():
-        return "AI ne khaali file di."
-    # the answer may add at most AI_OUT_MAX bytes to the file (a big file is kept, only the new part is capped)
-    if len(new.encode("utf-8")) - len(original.encode("utf-8")) > AI_OUT_MAX:
-        return "AI ki file bahut badi hai."
-    try:
-        tree = ast.parse(new)
-        compile(new, "<ai-output>", "exec")
-    except (SyntaxError, ValueError):
-        return "AI ka code compile nahi hua (syntax galat hai)."
-    if new.count("# >>> hyv-injected:backup") != 1 or new.count("# <<< hyv-injected:backup") != 1:
-        return "AI ne backup ka start aur end marker sahi nahi lagaya."
-    if "_hyv_bk_" not in new:
-        return "AI ne backup ka code nahi likha."
-    admin_ok = any(
-        isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "_HYV_BK_ADMINS" for t in n.targets)
-        and any(isinstance(c, ast.Constant) and c.value == admin_id for c in ast.walk(n.value))
-        for n in ast.walk(tree))
-    if not admin_ok:
-        return "AI ne admin ID sahi jagah nahi lagayi."
-    kinds = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-    old_names = {n.name for n in ast.parse(original).body if isinstance(n, kinds)}
-    new_names = {n.name for n in tree.body if isinstance(n, kinds)}
-    gone = sorted(old_names - new_names)
-    if gone:
-        return f"AI ne bot ka purana code hata diya ({', '.join(gone[:3])})."
-    old_lines, new_lines = original.splitlines(), new.splitlines()
-    # the same lines at the start and the end are skipped first: the diff then only looks at the changed part
-    # (a big file with a small change would take minutes otherwise)
-    pre, suf = 0, 0
-    lim = min(len(old_lines), len(new_lines))
-    while pre < lim and old_lines[pre] == new_lines[pre]:
-        pre += 1
-    while suf < lim - pre and old_lines[len(old_lines) - 1 - suf] == new_lines[len(new_lines) - 1 - suf]:
-        suf += 1
-    old_mid = old_lines[pre:len(old_lines) - suf]
-    new_mid = new_lines[pre:len(new_lines) - suf]
-    removed, added = 0, []
-    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old_mid, new_mid, autojunk=False).get_opcodes():
-        if tag in ("replace", "delete"):
-            for line in old_mid[i1:i2]:
-                if re.match(r"\s*(async\s+def|def|class)\s", line):
-                    return "AI ne purane function ya class ki line badal di."
-            removed += i2 - i1
-        if tag in ("replace", "insert"):
-            added.extend(new_mid[j1:j2])
-    if removed > 6:
-        return "AI ne purane code me bahut badlaav kiya."
-    added_text = "\n".join(added)
-    if AI_SECRET.search(added_text):
-        return "AI ne code me token ya key likh di."
-    if AI_BAD_CALLS.search(added_text) or AI_BAD_IMPORTS.search(added_text):
-        return "AI ne khatarnak call (system, subprocess ya network library) likh diya."
-    if any(host.lower() not in AI_ALLOWED_HOSTS for host in AI_URL_HOST.findall(added_text)):
-        return "AI ne ajeeb web address use kiya."
-    return None
-
-
-def ai_prompt(source, admin_id, lib, reason=None):
-    ref = backup_block(lib or "telebot", admin_id)
-    lib_name = {"telebot": "pyTelegramBotAPI (telebot)", "ptb": "python-telegram-bot v20+"}.get(
-        lib, "unknown or not supported by the templates")
-    rules = [
-        "Add a Database Export/Import feature to the bot file below, using the bot's own library.",
-        f"The bot library: {lib_name}. Use that library's own handler, keyboard and reply calls. Do not switch libraries.",
-        f"Put the Telegram id {admin_id} (the member who sent the file) in the line `_HYV_BK_ADMINS = {{{admin_id}}}`. "
-        "Only that id and the env variable HYV_ADMIN_IDS (comma separated) make an admin. Do not look for OWNER_ID "
-        "or any other admin variable.",
-        "Keep ALL original code. Only add new code, plus at most a few lines of hook edits (for example one line "
-        "that registers the new handlers after the bot object is created).",
-        "Start the new block with the line `# >>> hyv-injected:backup (added by the implementer bot)` and end it "
-        "with `# <<< hyv-injected:backup`. Use exactly one of each.",
-        "Every new name must start with `_hyv_bk_` or `_HYV_BK_`.",
-        "Admin only: the button `🗄 Database Export/Import` shows only to admins and opens a menu with "
-        "`📤 Export`, `📥 Import` and `🔙 Back`.",
-        "Export: a zip of the bot folder's data files (.db .sqlite .sqlite3 .json .csv .txt .pkl .yaml .yml .xml) "
-        "with manifest.json holding path, size and sha256 for each file. Copy databases with the sqlite3 backup API. "
-        "Never include .env, token or secret files, and never the bot's own .py file.",
-        "Import: the admin sends a zip. Check the manifest and every sha256. Refuse absolute paths and '..' (zip-slip). "
-        "Keep a safety copy of the current files in a hyv_safety folder. Ask for confirmation before replacing "
-        "anything. Tell the admin to restart the bot.",
-        "Never change the bot's normal behaviour. Wrap the new handlers so an error is caught and reported as a "
-        "short message.",
-        "No hard-coded tokens or keys. No web addresses except the bot library's own Telegram calls. No eval, exec, "
-        "subprocess, os.system, socket or extra HTTP libraries.",
-        "Output: the full updated file in one ```python block, and nothing else.",
-    ]
-    text = "Task:\n" + "\n".join(f"- {r}" for r in rules)
-    text += ("\n\nWorking reference block (telebot style). Use its ideas and adapt the calls to the bot's library:\n"
-             "```python\n" + ref + "\n```")
-    text += "\n\nThe bot file:\n```python\n" + source + "\n```"
-    if reason:
-        text += f"\n\nYour previous answer was rejected because: {reason} Fix that, keep the rules, and send the full file again."
-    return text
-
-
-def ai_inject_backup(source, admin_id, cfg, http=None, lib=None):
-    """Asks the AI for the injection. Every answer is checked; a rejected answer goes back with the reason,
-    up to AI_TRIES times. Returns (new_source, None) or (None, reason). Never raises."""
-    size = len(source.encode("utf-8"))
-    if size > AI_MAX_BYTES:
-        return None, too_big_text(size)
-    if size > AI_FULL_BACKUP_MAX:
-        return ai_inject_backup_block(source, admin_id, cfg, http, lib)
-    http = http if http is not None else requests
-    reason = None
-    for _ in range(AI_TRIES):
-        try:
-            reply = ai_request(cfg, AI_SYSTEM, ai_prompt(source, admin_id, lib, reason), http)
-        except AIError as e:
-            if not e.retry:
-                return None, f"AI se kaam nahi ho paya: {e}"
-            reason = str(e)
-            continue
-        new_source = extract_code(reply)
-        reason = check_ai_output(source, new_source, admin_id)
-        if reason is None:
-            return new_source, None
-    return None, f"AI ne {AI_TRIES} koshish ke baad bhi sahi code nahi diya (aakhri wajah: {reason})."
-
-
-# ---- Big files: the AI gets a compact view, never the whole file ------------------------------
-# The outline lists the top-level statements. The regions are numbered with the file's own line
-# numbers, COMPACT_CONTEXT lines around each line that matters. Regions that do not fit the prompt
-# budget are left out and named by line range, and the member is told about it.
-
-COMPACT_CONTEXT = 30
-TOO_BIG_PREFIX = "Ye file bahut badi hai."
-REMOVE_ANCHORS = re.compile(
-    r"\b(?:Flask|HTTPServer|http\.server|aiohttp|fastapi|FastAPI|uvicorn|serve_forever|app\.run|PORT"
-    r"|requests|urllib|sleep|RENDER_EXTERNAL_URL|Thread|while\s+True|(?i:ping\w*|keep_alive))\b")
-BACKUP_ANCHORS = re.compile(
-    r"\b(?:TeleBot|SafeTeleBot|Application\s*\.\s*builder|Updater|message_handler|callback_query_handler"
-    r"|CommandHandler|MessageHandler|add_handler|ReplyKeyboardMarkup|InlineKeyboardMarkup|KeyboardButton"
-    r"|infinity_polling|run_polling|start_polling)\b|\bdef\s+main\b|__name__\s*==|\.idle\s*\(")
-AI_BLOCK_SYSTEM = ("You write one code block for the Database Export/Import feature of one Python Telegram bot "
-                   "file. You never send the whole file. Reply only with the requested python block and the "
-                   "REGISTER line.")
-BLOCK_REGISTER = re.compile(r"REGISTER\s+AFTER\s+LINE\s+(\d+)\s+VAR\s+([A-Za-z_]\w*)")
-
-
-class ViewTooBig(Exception):
-    """The fixed parts of a prompt (task, outline, candidates) alone do not fit the budget."""
-
-
-def too_big_text(size=None):
-    """Plain refusal for a file over the AI limit: the real reason and the limit."""
-    got = f" Aapki file lagbhag {max(1, round(size / 1024))} KB ki hai." if size else ""
-    return (f"{TOO_BIG_PREFIX}{got} Limit {size_limit_text()} hai. Bot ka purana ya faltu bada hissa hata kar, "
-            "ya file ko do chhote hisso me bant kar dobara bhejo.")
-
-
-def too_big_view_text():
-    return (f"{TOO_BIG_PREFIX} AI ko bhejne layak chhota view (outline aur code ke hisse) bhi AI ki limit "
-            f"(lagbhag {AI_PROMPT_TOKENS} tokens) se bada ho gaya. Bot ko do chhote hisso me bant kar bhejo.")
-
-
-def _ranges_text(ranges, limit=30):
-    text = ", ".join(f"{s}-{e}" for s, e in ranges[:limit])
-    more = len(ranges) - limit
-    return text + (f" aur {more} aur" if more > 0 else "")
-
-
-def _merge_spans(spans):
-    out = []
-    for s, e in sorted(spans):
-        if out and s <= out[-1][1] + 1:
-            out[-1][1] = max(out[-1][1], e)
-        else:
-            out.append([s, e])
-    return [(s, e) for s, e in out]
-
-
-def _minus_spans(spans, cut):
-    """The parts of the (start, end) spans that are not inside any span of cut."""
-    out = []
-    for s, e in spans:
-        cur = s
-        for a, b in cut:
-            if b < cur or a > e:
-                continue
-            if a > cur:
-                out.append((cur, a - 1))
-            cur = max(cur, b + 1)
-            if cur > e:
-                break
-        if cur <= e:
-            out.append((cur, e))
-    return out
-
-
-def _render_region(lines, s, e):
-    body = "\n".join(f"{i:>6}| {lines[i - 1][:200]}" for i in range(s, e + 1))
-    return f"--- lines {s}-{e} ---\n{body}"
-
-
-def compact_prompt(head, source, pattern, priority_lines, tail):
-    """Prompt for a big file: head (task text), the outline, numbered regions, then tail. The regions are
-    COMPACT_CONTEXT lines around each priority line (a candidate) and each line matching pattern; the
-    priority ones are taken first. Returns (prompt, hidden): hidden lists the (start, end) regions left out
-    for size. Raises ViewTooBig when the fixed parts or the first useful regions do not fit."""
-    lines = source.splitlines()
-    tree = ast.parse(source)
-    fixed = len(head) + len(tail) + 1500          # 1500: headers and the trim note
-    outline_budget = max(0, (AI_PROMPT_CHARS - fixed) // 3)
-    out_rows, used_rows = [], 0
-    for n in tree.body:
-        s, e = _span(n)
-        row = f"- lines {s}-{e}: {lines[s - 1].strip()[:60]}"
-        if used_rows + len(row) + 1 > outline_budget:
-            break
-        out_rows.append(row)
-        used_rows += len(row) + 1
-    if len(out_rows) < len(tree.body):
-        out_rows.append(f"- ... {len(tree.body) - len(out_rows)} more top-level lines not listed here")
-    outline = "\n".join(out_rows)
-    room = AI_PROMPT_CHARS - fixed - len(outline)
-    if room < AI_VIEW_MIN_ROOM:
-        raise ViewTooBig()
-    n_lines = len(lines)
-    pref = [0]
-    for ln in lines:
-        pref.append(pref[-1] + min(len(ln), 200) + 9)     # 9: "{n:>6}| " and the newline
-
-    def window(p):
-        return (max(1, p - COMPACT_CONTEXT), min(n_lines, p + COMPACT_CONTEXT))
-
-    def cost(s, e):
-        return pref[e] - pref[s - 1] + 25                 # 25: the "--- lines s-e ---" header
-
-    prio = sorted(set(priority_lines))
-    prio_set = set(prio)
-    chosen, hidden, used = [], [], 0
-
-    def take(s, e):
-        nonlocal used
-        if used + cost(s, e) <= room:
-            chosen.append((s, e))
-            used += cost(s, e)
-            return True
-        return False
-
-    for s, e in _merge_spans([window(p) for p in prio]):
-        if take(s, e):
-            continue
-        for p in prio:                                    # too big as one piece: try each candidate alone
-            if s <= p <= e and not take(*window(p)):
-                hidden.append(window(p))
-    others = sorted({a for a in pattern_lines(lines, pattern) if a not in prio_set})
-    last = 0                                              # windows are taken one by one, never past the last one
-    for a in others:
-        s, e = window(a)
-        s = max(s, last + 1)
-        if s > e:
-            continue
-        if not take(s, e):
-            hidden.append((s, e))
-        last = e
-    chosen = _merge_spans(chosen)
-    hidden = _minus_spans(_merge_spans(hidden), chosen)
-    body = "\n".join(_render_region(lines, s, e) for s, e in chosen)
-    note = ""
-    if hidden:
-        note = ("\n\nSome regions were left out to keep the prompt small. Lines not shown: "
-                + _ranges_text(hidden) + ".")
-    prompt = (f"{head}\n\nOutline (line ranges of the top-level code):\n{outline}\n\n"
-              f"Code regions (the numbers at the left are the file's real line numbers):\n{body}{note}{tail}")
-    if len(prompt) > AI_PROMPT_CHARS:
-        raise ViewTooBig()
-    return prompt, hidden
-
-
-def pattern_lines(lines, pattern):
-    """1-based numbers of the lines that match pattern."""
-    return [i for i, ln in enumerate(lines, 1) if pattern.search(ln)]
-
-
-def trim_note(hidden):
-    """What the member is told when some regions were left out of the AI's view."""
-    if not hidden:
-        return None
-    return ("File lambi thi, isliye AI ko sirf kuch hisse dikhaye gaye. Ye lines AI ne nahi dekhi: "
-            + _ranges_text(hidden) + ".")
-
-
-def backup_block_head(lib, admin_id):
-    ref = backup_block(lib or "telebot", admin_id)
-    lib_name = {"telebot": "pyTelegramBotAPI (telebot)", "ptb": "python-telegram-bot v20+"}.get(
-        lib, "unknown or not supported by the templates")
-    rules = [
-        "Write ONLY the new Export/Import block for the bot file below. The bot file is not sent back and "
-        "its code must not be rewritten.",
-        f"The bot library: {lib_name}. Use that library's own handler, keyboard and reply calls.",
-        f"Put the Telegram id {admin_id} in the line `_HYV_BK_ADMINS = {{{admin_id}}}`. Only that id and the "
-        "env variable HYV_ADMIN_IDS make an admin.",
-        "Start the block with `# >>> hyv-injected:backup (added by the implementer bot)` and end it with "
-        "`# <<< hyv-injected:backup`. Use exactly one of each.",
-        "Every new name must start with `_hyv_bk_` or `_HYV_BK_`. Do not redefine any existing name.",
-        "Admin only: the button `🗄 Database Export/Import` shows only to admins, with `📤 Export`, `📥 Import` "
-        "and `🔙 Back`.",
-        "Export and Import work as in the reference block. Import checks the manifest and sha256, refuses "
-        "absolute paths and '..', and keeps a safety copy.",
-        "Wrap the new handlers so an error is caught and reported in a short message. Never change the bot's "
-        "normal behaviour.",
-        "No hard-coded tokens or keys. No web addresses except the library's own Telegram calls. No eval, exec, "
-        "subprocess, os.system, socket or extra HTTP libraries.",
-        "After the block, on its own line, write: REGISTER AFTER LINE <n> VAR <name>. n is the last line number "
-        "of the top-level statement that creates the bot object, and name is the variable that statement "
-        "assigns. Take both from the outline or the regions.",
-        "Output: one ```python block holding only the new block, then the REGISTER line. Nothing else.",
-    ]
-    head = "Task:\n" + "\n".join(f"- {r}" for r in rules)
-    return head + ("\n\nWorking reference block (adapt the calls to the bot's library):\n```python\n"
-                   + ref + "\n```")
-
-
-def assemble_block_reply(source, reply, admin_id):
-    """The original file with the AI's block added: the register line after the bot statement, the block
-    after the imports. Raises RemovalError when the reply does not match the file."""
-    m = re.search(r"```[ \t]*(?:python|py)?[ \t]*\n(.*?)```", reply or "", re.S | re.I)
-    reg = BLOCK_REGISTER.search(reply or "")
-    if not m or not reg:
-        raise RemovalError("AI ne block ya REGISTER line sahi format me nahi di.")
-    block = m.group(1).strip("\n") + "\n"
-    if block.count("# >>> hyv-injected:backup") != 1 or block.count("# <<< hyv-injected:backup") != 1:
-        raise RemovalError("AI ne backup ka start aur end marker sahi nahi lagaya.")
-    try:
-        block_tree = ast.parse(block)
-    except (SyntaxError, ValueError):
-        raise RemovalError("AI ka block compile nahi hua (syntax galat hai).")
-    tree = ast.parse(source)
-    old_top = {n.name for n in tree.body if isinstance(n, DEF_KINDS)}
-    if any(isinstance(n, DEF_KINDS) and n.name in old_top for n in block_tree.body):
-        raise RemovalError("AI ne bot ka purana function ya class dobara likh diya.")
-    reg_no, var = int(reg.group(1)), reg.group(2)
-    stmt = next((n for n in tree.body if not isinstance(n, (ast.Import, ast.ImportFrom))
-                 and n.lineno <= reg_no <= n.end_lineno and var in _bound(n)), None)
-    if stmt is None:
-        raise RemovalError(f"REGISTER line ({reg_no}, {var}) bot ki line se nahi mili. Sahi line batao.")
-    lines = source.splitlines(keepends=True)
-    end = stmt.end_lineno
-    if not lines[end - 1].endswith("\n"):
-        lines[end - 1] += "\n"
-    lines.insert(end, f"_hyv_bk_register({var})  # hyv-injected:backup-register\n")
-    src1 = "".join(lines)
-    body = ast.parse(src1).body
-    k = 0
-    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
-            and isinstance(body[0].value.value, str):
-        k = 1
-    while k < len(body) and isinstance(body[k], (ast.Import, ast.ImportFrom)):
-        k += 1
-    at = body[k - 1].end_lineno if k else 0
-    if at > end:
-        raise RemovalError("Imports bot banane wali line ke baad aate hain, isliye block sahi jagah nahi lag sakta.")
-    l1 = src1.splitlines(keepends=True)
-    head_part, tail_part = l1[:at], l1[at:]
-    if head_part and not head_part[-1].endswith("\n"):
-        head_part[-1] += "\n"
-    return "".join(head_part) + "\n" + block + "\n" + "".join(tail_part)
-
-
-def ai_inject_backup_block(source, admin_id, cfg, http=None, lib=None):
-    """Big files (over AI_FULL_BACKUP_MAX): the AI sees a compact view and writes only the block and one
-    register line. The code adds them and checks the whole result, like the full-file path does.
-    Returns (new_source, None) or (None, reason). Never raises."""
-    http = http if http is not None else requests
-    head = backup_block_head(lib, admin_id)
-    reason = None
-    for _ in range(AI_TRIES):
-        tail = "\n\nReply with the python block and the REGISTER line."
-        if reason:
-            tail += f"\n\nYour previous answer was rejected because: {reason[:400]} Fix it and send them again."
-        try:
-            prompt, _hidden = compact_prompt(head, source, BACKUP_ANCHORS, [], tail)
-        except ViewTooBig:
-            return None, too_big_view_text()
-        try:
-            reply = ai_request(cfg, AI_BLOCK_SYSTEM, prompt, http)
-        except AIError as e:
-            if not e.retry:
-                return None, f"AI se kaam nahi ho paya: {e}"
-            reason = str(e)
-            continue
-        if len((reply or "").encode("utf-8")) > AI_OUT_MAX:
-            reason = "AI ka jawab bahut bada hai."
-            continue
-        try:
-            new_source = assemble_block_reply(source, reply, admin_id)
-        except RemovalError as e:
-            reason = str(e)
-            continue
-        reason = check_ai_output(source, new_source, admin_id)
-        if reason is None and new_source.count("hyv-injected:backup-register") != 1:
-            reason = "AI ne register line sahi jagah nahi lagayi."
-        if reason is None:
-            return new_source, None
-    return None, f"AI ne {AI_TRIES} koshish ke baad bhi sahi code nahi diya (aakhri wajah: {reason})."
-
-
-# ---- Replacing old web server / pinger code (only when an AI key is set) ---------------------
-# The AI never writes code here. It only names line ranges of old code. The code checks every range
-# against the file's own syntax tree, deletes only those statements (and code that depends on them),
-# checks the result, and then the normal injection adds the new block.
+        return inject_backup(source, lib, admin_id), backup_done_text(admin_id)
+    except ValueError:
+        return None, "Is file mein bot ka main object nahi mila. File waisi hi rahegi."
+
+
+# ---- Removing old web server / pinger code (built in, no network) -------------------
+# The code finds the old statements in the file's own syntax tree, deletes only those statements
+# (and the code that depends on them), checks the result, and then the normal injection adds the
+# new block. Anything that cannot be done exactly leaves the file untouched.
 
 REMOVE_FORBID = re.compile(
     r"infinity_polling|run_polling|start_polling|\.idle\s*\(|asyncio\.run|\bTeleBot\s*\(|Application\.builder"
     r"|\bUpdater\s*\(|add_handler|message_handler|callback_query_handler|CommandHandler|MessageHandler"
-    r"|__name__\s*==|hyv-injected:backup|_hyv_bk_|_HYV_BK_")
+    r"|__name__\s*==|hyv-injected:backup|_hyv_bk_|_HYV_BK_"
+    r"|webhook|WEBHOOK|set_webhook|delete_webhook")   # a webhook setup is never removed (it is reported)
 REMOVE_MAX_PICKS = 200
-AI_REMOVE_SYSTEM = ("You find old web server and keep-alive pinger code in one Python Telegram bot file. "
-                    "You do not write or change code. Reply only with a JSON object such as "
-                    '{"remove": [[12, 14], [30, 30]]}, listing the start and end line (both included) of each '
-                    "statement to delete. Pick only from the candidate list you are given.")
 DEF_KINDS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 
 
 class RemovalError(Exception):
-    """A safe Hinglish reason why an AI removal plan was refused."""
+    """A safe Hinglish reason why the old code could not be removed exactly."""
 
 
 def _span(node):
@@ -1910,7 +1411,7 @@ def _base_match(node, kind, head, text, markers, targets):
         return True
     if kind == "web":
         return _any(WEB_SURE, head, re.M)
-    if _any(PINGER_SURE, head, re.I | re.M):
+    if _any(PINGER_SURE, head, re.I | re.M) or _loop_pinger(node, text):
         return True
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return (node.name in targets
@@ -1935,40 +1436,93 @@ def _related(tree, lines, kinds):
     forbidden |= {n for n in stmts if isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
                   and isinstance(n.value.value, str)}
     parents = _parents(tree)
+    counts = _binder_counts(stmts)
+    uses = {}                                 # name -> statements that load it in their own expressions
+    for n in stmts:
+        for name in own[n]:
+            uses.setdefault(name, []).append(n)
     rel = set()
     for kind in kinds:
         markers = _marker_ranges(lines, kind)
         cur = {n for n in stmts if n not in forbidden
                and _base_match(n, kind, heads[n], segs[n], markers, targets)}
+        base = set(cur)
         changed = True
         while changed:
             changed = False
-            names = set()
-            for n in cur:
-                names |= _bound(n)
+            names = _trigger_names(cur, counts)
+            func_names = {c.name for c in cur if isinstance(c, DEF_KINDS)}
             for n in stmts:
                 if n in cur or n in forbidden:
                     continue
-                by_name = bool(own[n] & names)
+                # a user's def that only calls the old functions (a route that returns keep_alive()) is user
+                # code: it is not pulled in by those names, so the dangling-reference check refuses instead
+                if isinstance(n, DEF_KINDS):
+                    by_name = bool(own[n] & (names - func_names))
+                else:
+                    by_name = bool(own[n] & names)
+                # a def used only from related code (a helper that only run_web() calls) goes too
+                by_users = (isinstance(n, DEF_KINDS) and counts.get(n.name, 0) == 1
+                            and _only_used_inside(n.name, uses.get(n.name, []), n, cur, parents))
                 # a def is a unit when all of its body is related (a thread target, for example)
-                by_body = isinstance(n, DEF_KINDS) and bool(n.body) and all(b in cur for b in n.body)
+                by_body = isinstance(n, DEF_KINDS) and bool(n.body) and all(b in base for b in n.body)
                 # the sleep line of a pinger loop belongs to the pinger
                 by_sleep = (kind == "pinger" and parents.get(n) in cur
                             and not any(hasattr(n, a) for a in ("body", "handlers", "orelse", "finalbody"))
                             and bool(re.search(PERIODIC_SLEEP, segs[n])))
-                if by_name or by_body or by_sleep:
+                if by_name or by_users or by_body or by_sleep:
                     cur.add(n)
                     changed = True
         rel |= cur
     return rel
 
 
+def _only_used_inside(name, users, defn, cur, parents):
+    """True when the name of a def is used somewhere, and every use is inside a related statement."""
+    found = False
+    for u in users:
+        if u is defn:
+            continue
+        found = True
+        p, inside = u, False
+        while p is not None:
+            if p in cur:
+                inside = True
+                break
+            p = parents.get(p)
+        if not inside:
+            return False
+    return found
+
+
 def _candidate_lines(source, kinds):
-    """(start, end, first line) for every statement the AI may pick for these kinds."""
+    """(start, end, first line) for every statement that belongs to these kinds."""
     lines = source.splitlines()
     tree = ast.parse(source)
     rel = _related(tree, lines, kinds)
     return [(*_span(n), lines[_span(n)[0] - 1].strip()[:80]) for n in _stmts(tree) if n in rel]
+
+
+def _binder_counts(stmts):
+    """How many statements bind each name (imports are shared, so they are not counted here)."""
+    counts = {}
+    for n in stmts:
+        if isinstance(n, (ast.Import, ast.ImportFrom)):
+            continue
+        for name in _bound(n):
+            counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def _trigger_names(nodes, counts):
+    """Names bound by these statements that no other statement in the file binds. Only these can pull
+    a dependant in or count as a dangling reference, so a shared name (an import, or a name set twice)
+    never drags unrelated code along."""
+    out = set()
+    for n in nodes:
+        if not isinstance(n, (ast.Import, ast.ImportFrom)):
+            out |= {x for x in _bound(n) if counts.get(x, 0) == 1}
+    return out
 
 
 def _label(node):
@@ -2005,11 +1559,12 @@ def _remove_code(source, picks, kinds):
         return False
 
     if not picks:
-        raise RemovalError("AI ne koi purana code nahi pehchana.")
+        raise RemovalError("Purana web server ya pinger code nahi mila.")
+    counts = _binder_counts(stmts)
     removed = set()
     for pick in picks[:REMOVE_MAX_PICKS]:
         if pick not in by_span:
-            raise RemovalError(f"Line {pick[0]}-{pick[1]} purana web server ya pinger code nahi hai. Sahi lines chuno.")
+            raise RemovalError(f"Line {pick[0]}-{pick[1]} purana web server ya pinger code nahi hai.")
         removed.add(by_span[pick])
 
     markers = {k: _marker_ranges(plain, k) for k in kinds}
@@ -2017,9 +1572,7 @@ def _remove_code(source, picks, kinds):
     changed = True
     while changed:
         changed = False
-        names = set()
-        for n in removed:
-            names |= _bound(n)
+        names = _trigger_names(removed, counts)
         for n in stmts:                       # dependants of removed names
             if gone(n) or not (own[n] & names):
                 continue
@@ -2084,6 +1637,18 @@ def _remove_code(source, picks, kinds):
             s = spans[body[0]][0]
             repl[s] = re.match(r"[ \t]*", plain[s - 1]).group(0) + "pass"
 
+    # A removed block that sat after a blank line also takes the blank lines behind it,
+    # so removing and adding the same block again leaves the file exactly the same.
+    for s in [s for s in sorted(drop) if s - 1 not in drop]:
+        e = s
+        while e + 1 in drop:
+            e += 1
+        if s > 1 and not plain[s - 2].strip():
+            k = e + 1
+            while k <= len(lines) and k not in drop and not plain[k - 1].strip():
+                drop.add(k)
+                k += 1
+
     out = []
     for i, line in enumerate(lines, 1):
         if i in repl:
@@ -2111,112 +1676,20 @@ def _remove_code(source, picks, kinds):
     for n in removed:
         removed_names |= _bound(n)
     if (removed_names - kept_bound) & loads:
-        raise RemovalError("Hataye gaye code ka koi hissa baaki code me use ho raha hai.")
+        users = sorted(spans[n][0] for n in stmts if n not in removed and not gone(n) and own[n] & removed_names)
+        where = f" (purani file ki line {', '.join(str(x) for x in users[:3])})" if users else ""
+        raise RemovalError(f"Hataye gaye code ka koi hissa baaki code me use ho raha hai{where}.")
     info = sorted((spans[n][0], spans[n][1], _label(n)) for n in top)
     return new_source, info
 
 
-def _parse_picks(reply):
-    m = re.search(r"\{.*\}", reply or "", re.S)
-    if not m:
-        raise RemovalError("AI ka jawab samajh nahi aaya.")
-    try:
-        data = json.loads(m.group(0))
-    except ValueError:
-        raise RemovalError("AI ka jawab samajh nahi aaya.")
-    picks = data.get("remove") if isinstance(data, dict) else None
-    if not isinstance(picks, list):
-        raise RemovalError("AI ne lines ki list nahi di.")
-    out = []
-    for p in picks:
-        if isinstance(p, list) and len(p) == 2 and all(isinstance(x, int) and not isinstance(x, bool) for x in p):
-            out.append((p[0], p[1]))
-        else:
-            raise RemovalError("AI ne line numbers sahi format me nahi diye.")
-    return out
-
-
-def _remove_prompt(source, kinds, cands, reason=None):
-    what = " and ".join("web server" if k == "web" else "pinger" for k in kinds)
-    text = (f"Task: the owner wants a new {what} added to this bot. Pick the OLD {what} code to delete.\n"
-            "- Pick only from the candidate list. Use the start and end line exactly as listed.\n"
-            "- Never pick the bot's handlers, the polling or run call, the main entry, the bot object, or unrelated code.\n"
-            "- Pick the statements that exist only for the old web server or pinger (imports, the app object, routes, "
-            "the thread start, the function itself).\n"
-            'Reply only with JSON: {"remove": [[start, end], ...]}\n\n'
-            "Candidates:\n" + "\n".join(f"- lines {s}-{e}: {first}" for s, e, first in cands))
-    text += "\n\nThe bot file:\n```python\n" + source + "\n```"
-    if reason:
-        text += f"\n\nYour previous answer was rejected because: {reason} Fix it and send the JSON again."
-    return text
-
-
-def _remove_head(kinds, cands):
-    """The task part of the removal prompt for a big file (the file itself comes as regions)."""
-    what = " and ".join("web server" if k == "web" else "pinger" for k in kinds)
-    return (f"Task: the owner wants a new {what} added to this bot. Pick the OLD {what} code to delete.\n"
-            "- Pick only from the candidate list. Use the start and end line exactly as listed.\n"
-            "- Never pick the bot's handlers, the polling or run call, the main entry, the bot object, or unrelated code.\n"
-            "- Pick the statements that exist only for the old web server or pinger (imports, the app object, routes, "
-            "the thread start, the function itself).\n"
-            'Reply only with JSON: {"remove": [[start, end], ...]}\n\n'
-            "Candidates:\n" + "\n".join(f"- lines {s}-{e}: {first}" for s, e, first in cands))
-
-
-def ai_remove_old(source, kinds, cfg, http=None, notes=None):
-    """Asks the AI which old code to delete, checks the answer, and applies it. Up to AI_TRIES tries.
-    Small files go in whole. Bigger files (up to AI_MAX_BYTES) go as a compact view: the outline plus
-    numbered regions around the old code. Trimmed regions are described in notes for the member.
-    Returns (new_source, removed, None) or (None, None, reason). Never raises."""
-    size = len(source.encode("utf-8"))
-    if size > AI_MAX_BYTES:
-        return None, None, too_big_text(size)
-    http = http if http is not None else requests
-    cands = _candidate_lines(source, kinds)
-    whole = size <= AI_FULL_REMOVE_MAX
-    head = None if whole else _remove_head(kinds, cands)
-    priority = [s for s, _e, _f in cands]
-
-    def make(reason):
-        if whole:
-            return _remove_prompt(source, kinds, cands, reason), []
-        tail = "\n\nReply only with JSON: {\"remove\": [[start, end], ...]}"
-        if reason:
-            tail += f"\n\nYour previous answer was rejected because: {reason[:400]} Fix it and send the JSON again."
-        return compact_prompt(head, source, REMOVE_ANCHORS, priority, tail)
-
-    try:
-        make(None)
-    except ViewTooBig:
-        return None, None, too_big_view_text()
-    reason = None
-    hidden = []
-    for _ in range(AI_TRIES):
-        prompt, hidden = make(reason)
-        try:
-            reply = ai_request(cfg, AI_REMOVE_SYSTEM, prompt, http, max_tokens=2048)
-        except AIError as e:
-            if not e.retry:
-                return None, None, f"AI se kaam nahi ho paya: {e}"
-            reason = str(e)
-            continue
-        try:
-            new_source, removed = _remove_code(source, _parse_picks(reply), kinds)
-        except RemovalError as e:
-            reason = str(e)
-            continue
-        if notes is not None and hidden:
-            notes.append(trim_note(hidden))
-        return new_source, removed, None
-    return None, None, reason
-
-
 def _replace_targets(source, web, pin, want_web, want_pin):
-    """Kinds whose old code must be removed first: the option wants it, it is there, and we can
-    point at it. Empty list means the old path (add only, or skip) applies."""
+    """Kinds whose old code must be removed first: the option wants it, the code is sure to be
+    there, and we can point at it. An unsure match is never removed (it is only reported).
+    Empty list means the old path (add only, or skip) applies."""
     targets = []
     for kind, want, status in (("web", want_web, web), ("pinger", want_pin, pin)):
-        if want and status != "none" and _candidate_lines(source, [kind]):
+        if want and status == "sure" and _candidate_lines(source, [kind]):
             targets.append(kind)
     return targets
 
@@ -2228,82 +1701,341 @@ def _marker_lines(text, kind):
     return start, end
 
 
-def plan_replace(source, choice, targets, web, pin, ai_cfg, http=None):
-    """The AI-key path: remove the old code of the chosen kinds, then add the new blocks.
-    Returns (new_source, reply_text), or (None, reason) and the original file stays as it is."""
+def _top_picks(source, kinds):
+    """Spans of the outermost related statements of these kinds (their inner statements go with them)."""
+    lines = source.splitlines()
+    tree = ast.parse(source)
+    rel = _related(tree, lines, kinds)
+    parents = _parents(tree)
+
+    def inside(n):
+        p = parents.get(n)
+        while p is not None:
+            if p in rel:
+                return True
+            p = parents.get(p)
+        return False
+
+    return sorted({_span(n) for n in rel if not inside(n)})
+
+
+def _where(source, kind, status):
+    """Line numbers (up to 5) where the sure or unsure pattern of this kind shows up. Text only."""
+    if kind == "web":
+        pats, flags = (WEB_SURE if status == "sure" else WEB_UNSURE), re.M
+    else:
+        pats, flags = (PINGER_SURE if status == "sure" else PINGER_UNSURE), re.I | re.M
+    hits = [i for i, ln in enumerate(source.splitlines(), 1) if any(re.search(p, ln, flags) for p in pats)]
+    return ("line " + ", ".join(str(i) for i in hits[:5])) if hits else ""
+
+
+def _skip_phrase(kind, status, where=""):
+    name = "Web server" if kind == "web" else "Pinger"
+    spot = f" {where} par" if where else ""
+    if status == "sure":
+        return f"{name} ka code{spot} hai, par use exact hata nahi paya"
+    return f"{name} jaisa code{spot} lagta hai (pakka nahi), isliye use nahi chheda"
+
+
+# ---- Automatic repair pass (built in, runs on every returned file) -------------------------
+# Each fix is tried on a copy. It is kept only if the copy compiles and its statement shape (the
+# kinds and names of the statements, imports aside) matches the file before it. Otherwise it is
+# dropped. Warnings are only reported; nothing is changed for them.
+
+NBSP = " "
+SMART_QUOTES = str.maketrans({"“": '"', "”": '"', "„": '"', "‘": "'", "’": "'"})
+TOKEN_LITERAL = re.compile(r"""(["'])\d{6,12}:[A-Za-z0-9_-]{30,}\1""")
+TOKEN_ENV = 'os.environ.get("BOT_TOKEN", "")'
+POLL_CALLS = ("infinity_polling", "polling", "run_polling", "start_polling")
+TOKEN_WARN = ("Token file me likha tha, ab bot use BOT_TOKEN environment variable se leta hai. "
+              "Purana token ab surakshit nahi hai: BotFather me jaakar naya token banao, "
+              "aur Render me BOT_TOKEN me naya token daalo.")
+PIP_NAMES = {"telebot": "pyTelegramBotAPI", "telegram": "python-telegram-bot", "flask": "Flask",
+             "dotenv": "python-dotenv", "yaml": "PyYAML", "PIL": "Pillow", "bs4": "beautifulsoup4",
+             "dateutil": "python-dateutil", "cv2": "opencv-python", "jwt": "PyJWT"}
+
+
+def _shape(tree):
+    return sorted((type(n).__name__, getattr(n, "name", "")) for n in ast.walk(tree)
+                  if isinstance(n, ast.stmt) and not isinstance(n, (ast.Import, ast.ImportFrom)))
+
+
+def _parse_ok(src):
+    try:
+        compile(src, "<bot>", "exec")
+        return True
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return False
+
+
+def _call_name(node):
+    f = node.func
+    return f.attr if isinstance(f, ast.Attribute) else (f.id if isinstance(f, ast.Name) else "")
+
+
+def _fix_app_run(text):
+    """Flask app.run: host 0.0.0.0 and a PORT from the environment. Only plain one-line calls are changed.
+    Returns (new_text, label) or None."""
+    tree = ast.parse(text)
+    apps = {t.id for n in ast.walk(tree) if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call)
+            and isinstance(n.value.func, ast.Name) and n.value.func.id == "Flask"
+            for t in n.targets if isinstance(t, ast.Name)}
+    if not apps:
+        return None
+    lines = text.split("\n")
+    labels = []
+    for n in ast.walk(tree):
+        if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "run"
+                and isinstance(n.func.value, ast.Name) and n.func.value.id in apps):
+            continue
+        if n.lineno != n.end_lineno:
+            continue
+        name, i = n.func.value.id, n.lineno - 1
+        ln = lines[i]
+        if not n.args and not n.keywords:
+            new = re.sub(r"\b%s\.run\(\s*\)" % re.escape(name),
+                         f'{name}.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))', ln, count=1)
+            if new != ln:
+                lines[i] = new
+                labels.append("host 0.0.0.0 aur port PORT env se")
+            continue
+        host = next((k for k in n.keywords if k.arg == "host"), None)
+        port = next((k for k in n.keywords if k.arg == "port"), None)
+        if host is not None and isinstance(host.value, ast.Constant) and host.value.value != "0.0.0.0":
+            new = re.sub(r"\bhost\s*=\s*(['\"])[^'\"]*\1", 'host="0.0.0.0"', ln, count=1)
+            if new != ln:
+                lines[i] = ln = new
+                labels.append("host 0.0.0.0 kar diya")
+        if (port is not None and isinstance(port.value, ast.Constant) and isinstance(port.value.value, int)
+                and "os.environ" not in ln):
+            new = re.sub(r"\bport\s*=\s*(\d+)", r'port=int(os.environ.get("PORT", \1))', ln, count=1)
+            if new != ln:
+                lines[i] = new
+                labels.append("port PORT env se")
+    if not labels:
+        return None
+    return "\n".join(lines), "Flask app.run: " + ", ".join(dict.fromkeys(labels))
+
+
+def _fix_imports(text):
+    """Adds a missing import of os, threading or time (used but never imported). Returns (text, names) or None."""
+    tree = ast.parse(text)
+    bound, used = set(), set()
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.Import, ast.ImportFrom)):
+            bound |= {a.asname or a.name.split(".")[0] for a in n.names}
+        elif isinstance(n, ast.Name):
+            (bound if isinstance(n.ctx, ast.Store) else used).add(n.id)
+        elif isinstance(n, DEF_KINDS):
+            bound.add(n.name)
+        elif isinstance(n, ast.arg):
+            bound.add(n.arg)
+    missing = [m for m in ("os", "threading", "time") if m in used and m not in bound]
+    if not missing:
+        return None
+    imports = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
+    first = tree.body[0] if tree.body else None
+    if imports:
+        pos = imports[-1].end_lineno
+    elif isinstance(first, ast.Expr) and isinstance(getattr(first, "value", None), ast.Constant) \
+            and isinstance(first.value.value, str):
+        pos = first.end_lineno
+    else:
+        pos = 0
+    lines = text.split("\n")
+    lines[pos:pos] = [f"import {m}" for m in missing]
+    return "\n".join(lines), missing
+
+
+def _untab(ln):
+    lead = re.match(r"[ \t]*", ln).group(0)
+    return lead.expandtabs(4) + ln[len(lead):]
+
+
+def auto_repair(source):
+    """Returns (new_source, fixes, warnings). fixes: Hinglish lines for what was changed. warnings: what
+    only needs a look (nothing is changed for those). A fix that breaks the file is dropped."""
+    fixes, warns = [], []
+    try:
+        shape = _shape(ast.parse(source))
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        shape = None
+    text = source
+
+    def apply(label, cand):
+        nonlocal text, shape
+        if cand is None or cand == text or not _parse_ok(cand):
+            return False
+        new_shape = _shape(ast.parse(cand))
+        if shape is not None and new_shape != shape:
+            return False
+        text, shape = cand, new_shape
+        fixes.append(label)
+        return True
+
+    if "﻿" in text:
+        apply("Ek ajeeb nishaan (BOM) hata diya", text.replace("﻿", ""))
+    if "\r" in text:
+        apply("Windows ki line ending (CRLF) normal kar di", text.replace("\r\n", "\n").replace("\r", "\n"))
+    if re.search(r"(?m)^[ \t]*\t", text):
+        apply("Indent me tab ko spaces se badal diya", "\n".join(_untab(ln) for ln in text.split("\n")))
+    if NBSP in text and not _parse_ok(text):
+        apply("Code me ajeeb space (NBSP) normal space se badal di", text.replace(NBSP, " "))
+    if not _parse_ok(text) and any(ord(ch) in SMART_QUOTES for ch in text):
+        apply("Code me smart quotes normal quotes se badal diye", text.translate(SMART_QUOTES))
+    if TOKEN_LITERAL.search(text):
+        apply("Token ko file se hata kar BOT_TOKEN environment variable se lene laga", TOKEN_LITERAL.sub(TOKEN_ENV, text))
+        warns.append(TOKEN_WARN)
+    res = _fix_app_run(text) if _parse_ok(text) else None
+    if res is not None:
+        apply(res[1], res[0])
+    res = _fix_imports(text) if _parse_ok(text) else None
+    if res is not None:
+        apply("Chhuta hua import jod diya: " + ", ".join(res[1]), res[0])
+
+    if not _parse_ok(text):
+        return text, fixes, warns
+    tree = ast.parse(text)
+    polls = sorted(n.lineno for n in ast.walk(tree) if isinstance(n, ast.Call) and _call_name(n) in POLL_CALLS)
+    if len(polls) > 1:
+        warns.append("Bot chalane wali line (polling) " + ", ".join(f"line {x}" for x in polls)
+                     + " par hai. Ek hi rakho. Maine kuch nahi hataya.")
+    hooks = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name):
+            name = n.id
+        elif isinstance(n, ast.Attribute):
+            name = n.attr
+        elif isinstance(n, ast.keyword) and n.arg:
+            name = n.arg
+        elif isinstance(n, DEF_KINDS):
+            name = n.name
+        else:
+            continue
+        if "webhook" in name.lower():
+            hooks.add(n.lineno)
+    if hooks and polls:
+        warns.append(f"Webhook (line {min(hooks)}) aur polling dono lage hain. Telegram me ek hi chalta hai. "
+                     "Maine kuch nahi badla, ise check karna.")
+    slow = []
+    for fn in ast.walk(tree):
+        if isinstance(fn, ast.AsyncFunctionDef):
+            for c in ast.walk(fn):
+                if isinstance(c, ast.Call) and ((isinstance(c.func, ast.Attribute) and c.func.attr == "sleep"
+                                                 and isinstance(c.func.value, ast.Name) and c.func.value.id == "time")
+                                                or (isinstance(c.func, ast.Name) and c.func.id == "sleep")):
+                    slow.append(f"{fn.name} me line {c.lineno}")
+    if slow:
+        warns.append("Async function me time.sleep hai (" + "; ".join(slow[:3]) + "). Ye bot ko ruka deta hai, "
+                     "asyncio.sleep behtar hai. Maine nahi badla.")
+    return text, fixes, warns
+
+
+def scan_requirements(source):
+    """pip package names for the third-party imports of this file. No versions."""
+    tree = ast.parse(source)
+    mods = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            mods |= {a.name.split(".")[0] for a in n.names}
+        elif isinstance(n, ast.ImportFrom) and n.level == 0 and n.module:
+            mods.add(n.module.split(".")[0])
+    std = getattr(sys, "stdlib_module_names", frozenset())
+    return sorted({PIP_NAMES.get(m, m) for m in mods if m not in std and m != "__future__"})
+
+
+def _repair_lines(fixes, warns):
+    out = []
+    if fixes:
+        out.append("Apne aap ye theek kiya:")
+        out.extend(f"- {f}" for f in fixes)
+    if warns:
+        out.append("Dhyan do (maine ye nahi badla):")
+        out.extend(f"- {w}" for w in warns)
+    return out
+
+
+def _finish(new_source, text):
+    """Runs the repair pass on a finished file and adds its report to the text."""
+    fixed, fixes, warns = auto_repair(new_source)
+    extra = _repair_lines(fixes, warns)
+    return fixed, "\n".join([text, *extra]) if extra else text
+
+
+def plan_backup_checked(source, admin_id):
+    new_source, text = plan_backup(source, admin_id)
+    if new_source is None:
+        return None, text
+    return _finish(new_source, text)
+
+
+def plan(source, choice, admin_id=None):
+    """Returns (new_source, reply_text). new_source is None when the file is left as it is.
+    The old web server or pinger code of the chosen kinds is removed first (only if it is found exactly),
+    then the new block is added, then the repair pass runs on the result."""
+    if choice == BTN_DB:
+        return plan_backup_checked(source, admin_id)
+    web = web_server_status(source)
+    pin = pinger_status(source)
     want_web = choice in (BTN_WEB, BTN_BOTH)
     want_pin = choice in (BTN_PINGER, BTN_BOTH)
+    targets = _replace_targets(source, web, pin, want_web, want_pin)
     add_web = want_web and (web == "none" or "web" in targets)
     add_pin = want_pin and (pin == "none" or "pinger" in targets)
-    notes = []
-    new_source, removed, err = ai_remove_old(source, targets, ai_cfg, http, notes)
-    if new_source is None:
-        if err and err.startswith(TOO_BIG_PREFIX):
-            return None, f"{err} File waisi hi rahegi."
-        return None, (f"AI purana code sahi pehchan nahi paya ({err}). Isliye kuch nahi badla. "
-                      "File waisi hi rahegi.")
+    skipped = []
+    if want_web and not add_web:
+        skipped.append(_skip_phrase("web", web, _where(source, "web", web)))
+    if want_pin and not add_pin:
+        skipped.append(_skip_phrase("pinger", pin, _where(source, "pinger", pin)))
+    if not add_web and not add_pin:
+        return None, ". ".join(skipped) + ". Isliye maine kuch add nahi kiya. File waisi hi rahegi."
+
+    lines, base = [], source
+    if targets:
+        try:
+            base, removed = _remove_code(source, _top_picks(source, targets), targets)
+        except RemovalError as e:
+            return None, f"{e} Isliye kuch nahi badla. File waisi hi rahegi."
+        if removed:
+            lines.append("Purana code hata diya (purani file ki line):")
+            for s, e, label in removed:
+                lines.append(f"- line {s}" if s == e else f"- line {s}-{e}: {label}")
     try:
-        out = inject(new_source, add_web, add_pin)
+        out = inject(base, add_web, add_pin)
     except (ValueError, SyntaxError):
         return None, "Naya code jodne ki jaanch fail hui. Isliye kuch nahi badla. File waisi hi rahegi."
     for kind in ("web", "pinger"):
         if out.count(f"# >>> hyv-injected:{kind}") > 1 or out.count(f"# <<< hyv-injected:{kind}") > 1:
             return None, "Naya code do baar lag raha tha. Isliye kuch nahi badla. File waisi hi rahegi."
 
-    text = ["Purana code hata kar naya daal diya."]
-    if removed:
-        text.append("Ye purana code hataya:")
-        for s, e, label in removed:
-            text.append(f"- line {s}" if s == e else f"- line {s}-{e}: {label}")
-    text.extend(notes)
-    text.append("Ye naya code jodha:")
+    if add_web and add_pin:
+        head = "Web server aur pinger dono naye daal diye."
+    elif add_web:
+        head = "Web server naya daal diya."
+    else:
+        head = "Pinger naya daal diya (default 5 minute)."
+    lines.insert(0, head)
     if add_web:
         s, e = _marker_lines(out, "web")
-        text.append(f"- Web server: line {s}-{e}")
+        lines.append(f"Naya web server: line {s}-{e}")
     if add_pin:
         s, e = _marker_lines(out, "pinger")
-        text.append(f"- Pinger: line {s}-{e} (default 5 minute)")
+        lines.append(f"Naya pinger: line {s}-{e} (default 5 minute)")
         if web_server_status(out) == "none":
-            text.append("Pinger tabhi kaam karega jab bot par web server bhi chale.")
-    text.append("Dhyan se check karna. Ye badlaav AI ne kiya hai, aur file ka code aapke chune hue AI provider "
-                "ko bheja gaya tha. Render par deploy karne se pehle ek baar test karna.")
-    return out, "\n".join(text)
-
-
-def plan(source, choice, admin_id=None, ai_cfg=None, http=None):
-    """Returns (new_source, reply_text). new_source is None when nothing needs adding."""
-    if choice == BTN_DB:
-        return plan_backup(source, admin_id, ai_cfg, http)
-    web = web_server_status(source)
-    pin = pinger_status(source)
-    want_web = choice in (BTN_WEB, BTN_BOTH)
-    want_pin = choice in (BTN_PINGER, BTN_BOTH)
-    if ai_cfg is not None and (want_web or want_pin):
-        targets = _replace_targets(source, web, pin, want_web, want_pin)
-        if targets:
-            return plan_replace(source, choice, targets, web, pin, ai_cfg, http)
-    add_web = want_web and web == "none"
-    add_pin = want_pin and pin == "none"
-    skipped = []
-    if want_web and not add_web:
-        skipped.append(_skip_phrase("web", web))
-    if want_pin and not add_pin:
-        skipped.append(_skip_phrase("pinger", pin))
-
-    if not add_web and not add_pin:
-        return None, ". ".join(skipped) + ". Isliye maine kuch add nahi kiya."
-
-    if add_web and add_pin:
-        text = "Web server aur pinger dono add kar diye."
-    elif add_web:
-        text = "Web server add kar diya."
-    else:
-        text = "Pinger add kar diya (default 5 minute)."
-        if web == "none":
-            text += " Pinger tabhi kaam karega jab bot par web server bhi chale."
+            lines.append("Pinger tabhi kaam karega jab bot par web server bhi chale.")
     for phrase in skipped:
-        text += f" {phrase}, isliye use chhoda."
-    return inject(source, add_web, add_pin), text
+        lines.append(f"{phrase}, isliye use chhoda.")
+    lines.append("Render par deploy karne se pehle ek baar test karna.")
+    return _finish(out, "\n".join(lines))
+
+
+def check_text(source, choice, admin_id=None):
+    """Dry run for /check: the same plan, nothing is saved. Returns the reply text."""
+    new_source, reply = plan(source, choice, admin_id)
+    if new_source is None:
+        return reply
+    pkgs = scan_requirements(new_source)
+    return reply + ("\nPackages (requirements.txt): " + ", ".join(pkgs) if pkgs else "")
 
 
 def status_block(source):
@@ -2370,7 +2102,11 @@ def latest_result(folder):
 # ---- Telegram side -------------------------------------------------------------------
 
 def _button(label):
-    return types.KeyboardButton(label, style=BUTTON_STYLE[label])
+    """Reply button with its colour. A telebot version without the style field gets a plain button."""
+    try:
+        return types.KeyboardButton(label, style=BUTTON_STYLE[label])
+    except TypeError:
+        return types.KeyboardButton(label)
 
 
 def option_keyboard():
@@ -2382,8 +2118,11 @@ def option_keyboard():
     kb.row(_button(BTN_BOTH))
     kb.row(_button(BTN_DB))
     kb.row(_button(BTN_STATUS), _button(BTN_LAST))
-    kb.row(_button(BTN_AI))
     return kb
+
+
+def too_big_text():
+    return f"Ye file {size_limit_text()} se badi hai. Chhoti .py file bhejo."
 
 
 def canonical_label(text):
@@ -2476,8 +2215,6 @@ class Implementer:
         self.data_dir = data_dir
         self.pause = pause  # seconds between animation steps (tests use 0)
         self.pending = {}  # chat_id -> (path of the saved original, display name)
-        self.ai_wait = set()  # chat ids asked for the AI key: their next text is the key
-        self.ai_model_wait = set()  # chat ids asked for an AI model name: their next text is the model
         self.lock = threading.Lock()
 
     def is_owner(self, user_id):
@@ -2511,7 +2248,7 @@ class Implementer:
         if not raw_name.lower().endswith(".py"):
             return self.bot.send_message(chat_id, warn("Sirf .py file bhejo. Dusri file ko main nahi chhedunga."))
         if (doc.file_size or 0) > MAX_BYTES:
-            return self.bot.send_message(chat_id, warn(too_big_text(doc.file_size)))
+            return self.bot.send_message(chat_id, warn(too_big_text()))
         prog = Progress(self.bot, chat_id, self.pause)
         prog.start()
         try:
@@ -2521,7 +2258,7 @@ class Implementer:
             except Exception:
                 return self.bot.send_message(chat_id, warn("File download nahi ho payi. Dobara bhejo."))
             if isinstance(data, bytes) and len(data) > MAX_BYTES:
-                return self.bot.send_message(chat_id, warn(too_big_text(len(data))))
+                return self.bot.send_message(chat_id, warn(too_big_text()))
             if not isinstance(data, bytes):
                 return self.bot.send_message(chat_id, warn("File sahi se nahi aayi. Dobara bhejo."))
             source, err = read_source(data)
@@ -2571,122 +2308,46 @@ class Implementer:
             self.bot.send_document(chat_id, f, visible_file_name=display_name(os.path.basename(path)),
                                    caption=card(f"🔁 {fx_bold('Pichli updated file')}", [], RESULT_NOTE))
 
-    def on_ai_button(self, message):
+    def on_check(self, message, raw):
+        """/check or "pehle check <option>": shows what the change would do. Nothing is saved or sent as a file."""
         chat_id = message.chat.id
+        if not self.is_owner(message.from_user.id):
+            return self.refuse(chat_id)
+        low = raw.lower()
+        rest = raw[len("/check"):] if low.startswith("/check") else raw[len("pehle check"):]
+        word = rest.strip().lower()
+        choice = CHECK_WORDS.get(word) or (canonical_label(rest.strip()) if canonical_label(rest.strip()) in OPTIONS else None)
+        if choice is None:
+            return self.bot.send_message(chat_id, card(f"🔍 {fx_bold('Pehle check')}", [
+                "/check web  ➜ web server", "/check pinger  ➜ pinger", "/check both  ➜ dono",
+                "/check db  ➜ Database Export/Import"], "Ye sirf dikhata hai, file nahi banati."))
         with self.lock:
-            self.ai_wait.add(chat_id)
-            self.ai_model_wait.discard(chat_id)
-        self.bot.send_message(chat_id, card(f"🤖 {fx_bold('AI key')}", [ai_status_line(self.data_dir)], AI_KEY_PROMPT),
-                              reply_markup=option_keyboard())
-
-    def on_ai_key(self, message):
-        chat_id = message.chat.id
-        with self.lock:
-            self.ai_wait.discard(chat_id)
-        key = (message.text or "").strip()
+            pending = self.pending.get(chat_id)
+        if pending is None:
+            return self.bot.send_message(chat_id, "📭 Pehle apni bot ki .py file bhejo.")
+        path, name = pending
         try:
-            self.bot.delete_message(chat_id, message.message_id)  # the key must not stay in the chat
+            with open(path, "rb") as f:
+                source, err = read_source(f.read())
+        except OSError:
+            return self.bot.send_message(chat_id, warn("Wo file ab nahi mil rahi. Dobara bhejo."))
+        if err:
+            return self.bot.send_message(chat_id, warn(err))
+        try:
+            reply = check_text(source, choice, message.from_user.id)
         except Exception:
-            pass
-        provider = detect_provider(key)
-        if provider is None:
-            return self.bot.send_message(chat_id, warn("Ye key pehchaan nahi aayi. OpenRouter (sk-or-), Groq (gsk_), "
-                                                       "OpenAI (sk-), Google Gemini (AIza) ya Anthropic (sk-ant-) "
-                                                       "ki key bhejo. Key save nahi hui."),
-                                         reply_markup=option_keyboard())
-        cfg = {"provider": provider, "key": key, "model": AI_DEFAULT_MODEL[provider], "base_url": None}
-        reason = ai_check_key(cfg, requests)
-        if reason is not None:
-            return self.bot.send_message(chat_id, warn(f"{AI_NAME[provider]} pehchana. {reason} Key save nahi hui. "
-                                                       "'AI key set karo' dabakar dobara bhejo."),
-                                         reply_markup=option_keyboard())
-        save_ai_config(self.data_dir, cfg)
-        self.bot.send_message(chat_id, card(f"✅ {fx_bold('AI key save ho gayi')}", [ai_status_line(self.data_dir)],
-                                            f"🧠 Ye {AI_NAME[provider]} ka model use hoga. Model badalna ho to "
-                                            "/aimodel likho, phir model ka naam bhejo (jaise anthropic/claude-sonnet-5.5). "
-                                            "Default wapas lene ke liye /aimodel default likho.\n"
-                                            "Ye key chat me nahi dikhegi. Hatane ke liye /aiclear likho."),
+            return self.bot.send_message(chat_id, warn("Kuch gadbad ho gayi, file nahi badli."))
+        self.bot.send_message(chat_id, card(f"🔍 {fx_bold('Pehle check')}: {name}", [reply],
+                                            "Ye sirf check tha, file nahi bani. Asli file ke liye option button dabao."),
                               reply_markup=option_keyboard())
-
-    def on_aimodel(self, message):
-        """/aimodel: shows the model in use and waits for a name. /aimodel NAME sets it at once,
-        /aimodel default goes back to the provider's default. Each new name gets a test call first."""
-        chat_id = message.chat.id
-        if not self.is_owner(message.from_user.id):
-            return self.refuse(chat_id)
-        parts = (message.text or "").split(maxsplit=1)
-        arg = parts[1].strip() if len(parts) > 1 else ""
-        cfg = load_ai_config(self.data_dir)
-        if cfg is None:
-            return self.bot.send_message(chat_id, warn("Pehle 'AI key set karo' se AI key daalo, phir model badal sakte ho."),
-                                         reply_markup=option_keyboard())
-        if not arg:
-            with self.lock:
-                self.ai_model_wait.add(chat_id)
-                self.ai_wait.discard(chat_id)
-            return self.bot.send_message(chat_id, card(f"🧠 {fx_bold('AI model')}", [ai_status_line(self.data_dir)],
-                                                       "Naya model ka naam bhejo (jaise anthropic/claude-sonnet-5.5). "
-                                                       "Default ke liye: default likho. Cancel karne ke liye koi menu button dabao."),
-                                         reply_markup=option_keyboard())
-        self.set_ai_model(chat_id, cfg, arg)
-
-    def on_ai_model_text(self, message):
-        chat_id = message.chat.id
-        with self.lock:
-            self.ai_model_wait.discard(chat_id)
-        self.set_ai_model(chat_id, load_ai_config(self.data_dir), (message.text or "").strip())
-
-    def set_ai_model(self, chat_id, cfg, name):
-        if cfg is None:
-            return self.bot.send_message(chat_id, warn("AI key nahi hai. Pehle 'AI key set karo' se key daalo."),
-                                         reply_markup=option_keyboard())
-        if env_ai_model():
-            return self.bot.send_message(chat_id, warn("Render me AI_MODEL env variable set hai, wo disk wali setting "
-                                                       "se pehle chalta hai. Model wahan khud badlo."),
-                                         reply_markup=option_keyboard())
-        if name.lower() == "default":
-            save_ai_model(self.data_dir, None)
-            return self.bot.send_message(chat_id, card(f"✅ {fx_bold('Model default ho gaya')}",
-                                                       [ai_status_line(self.data_dir)]), reply_markup=option_keyboard())
-        if not AI_MODEL_NAME.fullmatch(name):
-            return self.bot.send_message(chat_id, warn("Model ka naam galat lag raha hai (jaise anthropic/claude-sonnet-5.5). "
-                                                       "Purana model chal raha hai."), reply_markup=option_keyboard())
-        reason = ai_check_key(dict(cfg, model=name), requests)
-        if reason is not None:
-            return self.bot.send_message(chat_id, warn(f"{reason} Model save nahi hua, purana model chalta rahega."),
-                                         reply_markup=option_keyboard())
-        save_ai_model(self.data_dir, name)
-        self.bot.send_message(chat_id, card(f"✅ {fx_bold('Model badal gaya')}", [ai_status_line(self.data_dir)]),
-                              reply_markup=option_keyboard())
-
-    def on_ai_clear(self, message):
-        chat_id = message.chat.id
-        if not self.is_owner(message.from_user.id):
-            return self.refuse(chat_id)
-        with self.lock:
-            self.ai_wait.discard(chat_id)
-            self.ai_model_wait.discard(chat_id)
-        removed = delete_ai_config(self.data_dir)
-        text = "Bot ki disk se AI key hata di." if removed else "Bot ki disk par koi AI key nahi thi."
-        if os.environ.get("AI_API_KEY", "").strip():
-            text += " Render me AI_API_KEY env variable khud hata do."
-        self.bot.send_message(chat_id, text, reply_markup=option_keyboard())
 
     def on_text(self, message):
         chat_id = message.chat.id
         if not self.is_owner(message.from_user.id):
             return self.refuse(chat_id)
         raw = (message.text or "").strip()
-        if chat_id in self.ai_wait:
-            if raw and not raw.startswith("/") and canonical_label(raw) not in MENU_BUTTONS:
-                return self.on_ai_key(message)
-            with self.lock:
-                self.ai_wait.discard(chat_id)
-        if chat_id in self.ai_model_wait:
-            if raw and not raw.startswith("/") and canonical_label(raw) not in MENU_BUTTONS:
-                return self.on_ai_model_text(message)
-            with self.lock:
-                self.ai_model_wait.discard(chat_id)
+        if raw.lower().startswith("/check") or raw.lower().startswith("pehle check"):
+            return self.on_check(message, raw)
         # Old labels (no emoji) map to the current ones, so both work.
         text = canonical_label(raw)
         if text.startswith("/"):
@@ -2696,8 +2357,6 @@ class Implementer:
             return self.on_status(message)
         if text == BTN_LAST:
             return self.on_last(message)
-        if text == BTN_AI:
-            return self.on_ai_button(message)
         with self.lock:
             pending = self.pending.get(chat_id)
         if text not in OPTIONS:
@@ -2722,7 +2381,7 @@ class Implementer:
                 return self.bot.send_message(chat_id, warn(err))
             prog.step(1)
             try:
-                new_source, reply = plan(source, text, message.from_user.id, load_ai_config(self.data_dir), requests)
+                new_source, reply = plan(source, text, message.from_user.id)
             except Exception:
                 return self.bot.send_message(chat_id, warn("Kuch gadbad ho gayi, file nahi badli. "
                                                            "Dobara try karo."))
@@ -2731,10 +2390,17 @@ class Implementer:
             prog.step(2)
             out_name = result_name(name)
             out_path = save_unique(self.user_dir(chat_id, "results"), out_name, new_source.encode("utf-8"))
+            pkgs = scan_requirements(new_source)
             prog.action("upload_document")
             send_document_file(self.bot, chat_id, out_path, out_name,
                                card(f"✅ {fx_bold('Naya file taiyaar hai')}: {out_name}", [reply], RESULT_NOTE),
                                private)
+            if pkgs:
+                # Sent from memory only, so it never lands in the results folder (/last stays the bot file).
+                self.bot.send_document(chat_id, io.BytesIO(("\n".join(pkgs) + "\n").encode("utf-8")),
+                                       visible_file_name="requirements.txt",
+                                       caption=card(f"📦 {fx_bold('requirements.txt')}", [", ".join(pkgs)],
+                                                    "Ye packages Render par chahiye. Version Render ke hisaab se chalega."))
         finally:
             prog.finish()
 
@@ -2752,13 +2418,9 @@ def register_handlers(bot, impl):
     def _hyv_last(message):
         impl.on_last(message)
 
-    @bot.message_handler(commands=["aiclear"])
-    def _hyv_aiclear(message):
-        impl.on_ai_clear(message)
-
-    @bot.message_handler(commands=["aimodel"])
-    def _hyv_aimodel(message):
-        impl.on_aimodel(message)
+    @bot.message_handler(commands=["check"])
+    def _hyv_check(message):
+        impl.on_check(message, message.text or "/check")
 
     @bot.message_handler(content_types=["document"])
     def _hyv_document(message):
