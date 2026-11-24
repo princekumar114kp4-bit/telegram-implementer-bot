@@ -29,6 +29,8 @@ Buttons (owner ke liye, neeche ke keyboard me):
 - "Database Export/Import": owner/admin ke liye backup (export) aur restore (import). Import ke baad bot restart karein.
 - "AI key set karo": AI key save karta hai. Ye sirf Database Export/Import ke liye chahiye.
   Render par AI_API_KEY env variable se bhi de sakte hain (optional).
+- OpenRouter aur Groq ki keys bhi chalti hain, "AI key set karo" se daalein.
+- /aimodel likh kar AI ka model badal sakte hain.
 - "Status dekho" aur "Pichli file lo" bhi keyboard par hain.
 
 Important:
