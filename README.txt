@@ -23,11 +23,13 @@ Render par setup:
    PING_MINUTES        = (optional) kitne minute me self-ping ho, 1 se 60 tak (default 5)
 3. Bot ko Telegram par /start bhejein, phir apni bot ki .py file bhejein.
 
-Buttons:
-- "Web server add karo": web server jodta hai. Agar file me pehle se hai to nahi jodta.
-- "Pinger add karo": pinger jodta hai (default 5 minute). Pinger ke liye web server zaroori hai,
-  isliye Render par "Dono add karo" chuniye.
-- "Dono add karo": dono jodta hai, jo pehle se hai use chhod deta hai.
+Buttons (owner ke liye, neeche ke keyboard me):
+- "Web server add karo", "Pinger add karo", "Dono add karo": web server, pinger ya dono jodta hai.
+  Pinger ke liye web server zaroori hai, isliye Render par "Dono add karo" chuniye.
+- "Database Export/Import": owner/admin ke liye backup (export) aur restore (import). Import ke baad bot restart karein.
+- "AI key set karo": AI key save karta hai. Ye sirf Database Export/Import ke liye chahiye.
+  Render par AI_API_KEY env variable se bhi de sakte hain (optional).
+- "Status dekho" aur "Pichli file lo" bhi keyboard par hain.
 
 Important:
 - Button ka jawab ek message hota hai, popup nahi. Pehle se hai to message me likha aayega.
