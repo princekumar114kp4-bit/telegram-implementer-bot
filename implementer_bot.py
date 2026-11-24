@@ -29,17 +29,23 @@ import threading
 
 import telebot
 from telebot import types
+from telebot.apihelper import ApiException
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MAX_BYTES = 300 * 1024
 
-BTN_WEB = "Web server add karo"
-BTN_PINGER = "Pinger add karo"
-BTN_BOTH = "Dono add karo"
+BTN_WEB = "🌐 Web server add karo"
+BTN_PINGER = "📡 Pinger add karo"
+BTN_BOTH = "🧩 Dono add karo"
 OPTIONS = (BTN_WEB, BTN_PINGER, BTN_BOTH)
-BTN_STATUS = "Status dekho"      # same as the typed /status
-BTN_LAST = "Pichli file lo"      # same as the typed /last
+BTN_STATUS = "📊 Status dekho"   # same as the typed /status
+BTN_LAST = "🔁 Pichli file lo"   # same as the typed /last
 INFO_BUTTONS = (BTN_STATUS, BTN_LAST)
+# Labels from before the emoji were added. A tap with an old label still works.
+LEGACY_LABELS = {"Web server add karo": BTN_WEB, "Pinger add karo": BTN_PINGER,
+                 "Dono add karo": BTN_BOTH, "Status dekho": BTN_STATUS, "Pichli file lo": BTN_LAST}
+# Telegram message effects for the final result in a private chat: 🎉, 🔥, 👍 (tried in this order).
+EFFECT_IDS = ("5046509860389126442", "5104841245755180586", "5107584321108051014")
 RESULT_NOTE = "ℹ️ Ye naya file hai. Ise Render par khud dobara deploy karna hoga. Purani file waisi hi rahegi."
 
 # Button fill colours. Telegram's "primary" is blue, "success" is green (the Bot API accepts only
@@ -50,19 +56,65 @@ BUTTON_STYLE = {BTN_WEB: "primary", BTN_PINGER: "primary", BTN_BOTH: "primary",
 
 RULE = "━━━━━━━━━━━━━━"
 
-# Look of the bot's messages (text only). Button labels above stay exactly as they are.
-WELCOME = ("👋 Namaste! Main Bot Implementer hoon.\n"
+# ---- Premium look: Unicode fonts for headings and key words ----------------------------
+# Only ASCII letters and digits change. Every other character (emoji, dots, slashes, underscores,
+# Hinglish accents) stays as it is. Never use these on file names, paths, commands, code or
+# button callback data. Button labels stay plain text (emoji only).
+
+_BOLD = (0x1D400, 0x1D41A, 0x1D7CE)     # bold A-Z, a-z, 0-9
+_BOLD_ITALIC = (0x1D468, 0x1D482, None)  # bold italic A-Z, a-z (digits unchanged)
+_SCRIPT = (0x1D4D0, 0x1D4EA, None)      # bold script A-Z, a-z (digits unchanged)
+_SMALL = {"a": "ᴀ", "b": "ʙ", "c": "ᴄ", "d": "ᴅ", "e": "ᴇ", "f": "ꜰ", "g": "ɢ", "h": "ʜ", "i": "ɪ",
+          "j": "ᴊ", "k": "ᴋ", "l": "ʟ", "m": "ᴍ", "n": "ɴ", "o": "ᴏ", "p": "ᴘ", "q": "ǫ", "r": "ʀ",
+          "s": "ꜱ", "t": "ᴛ", "u": "ᴜ", "v": "ᴠ", "w": "ᴡ", "x": "x", "y": "ʏ", "z": "ᴢ"}
+
+
+def _fancy(text, up, low, digit):
+    out = []
+    for ch in str(text):
+        if "A" <= ch <= "Z":
+            out.append(chr(up + ord(ch) - 65))
+        elif "a" <= ch <= "z":
+            out.append(chr(low + ord(ch) - 97))
+        elif digit is not None and "0" <= ch <= "9":
+            out.append(chr(digit + ord(ch) - 48))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def fx_bold(text):
+    return _fancy(text, *_BOLD)
+
+
+def fx_bold_italic(text):
+    return _fancy(text, *_BOLD_ITALIC)
+
+
+def fx_script(text):
+    return _fancy(text, *_SCRIPT)
+
+
+def fx_small(text):
+    """Small capitals. Letters only (A-Z become small letters); everything else is unchanged."""
+    return "".join(_SMALL.get(ch.lower(), ch) if ch.isascii() and ch.isalpha() else ch for ch in str(text))
+
+
+# Look of the bot's messages (text only). Heading words use the fonts above; the rest is plain.
+WELCOME = (f"👋 {fx_bold('Namaste!')} Main Bot Implementer hoon.\n"
            f"{RULE}\n"
            "📎 Apni bot ki .py file bhejo.\n"
            "➕ Main web server aur/ya pinger add karke ek NAYI file bhejunga.\n"
            "🔒 Aapki original file main nahi chhedunga.\n\n"
+           f"🧭 {fx_script('Options')}\n"
            "File bhejne ke baad neeche ke option chuno:\n"
-           "🌐 Web server add karo\n"
-           "📡 Pinger add karo\n"
-           "🧩 Dono add karo\n\n"
+           f"{BTN_WEB}\n"
+           f"{BTN_PINGER}\n"
+           f"{BTN_BOTH}\n\n"
+           f"⚡ {fx_small('Quick buttons')}\n"
            "Kabhi bhi neeche ke buttons se:\n"
-           "📊 Status dekho: file me kya pehle se hai\n"
-           "🔁 Pichli file lo: pichli updated file dobara")
+           f"{BTN_STATUS}: file me kya pehle se hai\n"
+           f"{BTN_LAST}: pichli updated file dobara")
 STATUS_TEXT = {
     "sure": "✅ pehle se hai",
     "unsure": "❔ shayad hai (pakka nahi)",
@@ -388,11 +440,95 @@ def option_keyboard():
     return kb
 
 
+def canonical_label(text):
+    """Maps an old (no emoji) button label to the current one. Other text is returned unchanged."""
+    return LEGACY_LABELS.get(text, text)
+
+
+def warn(body):
+    """Error notice: warning emoji, a bold word, then the body text (body is kept as it is)."""
+    return f"⚠️ {fx_bold('Galti')}: {body}"
+
+
+# ---- Animation and effects -------------------------------------------------------------
+
+STAGE_LABELS = ("File padh raha hoon", "Web server aur pinger check kar raha hoon",
+                "Naya file bana raha hoon")
+BAR_LEN = 5
+
+
+def bar(done, total=BAR_LEN):
+    done = max(0, min(total, done))
+    return "▰" * done + "▱" * (total - done)
+
+
+class Progress:
+    """A short progress message, edited in steps while the bot works, plus a typing or upload action.
+    Every Telegram call here is wrapped: if one fails (for example "message is not modified"), the
+    real work still goes on. The message is deleted when the work is done."""
+
+    def __init__(self, bot, chat_id, pause=0.5):
+        self.bot = bot
+        self.chat_id = chat_id
+        self.pause = pause
+        self.msg_id = None
+
+    def _try(self, fn, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception:
+            return None
+
+    def _wait(self):
+        if self.pause > 0:
+            time.sleep(self.pause)
+
+    def _text(self, i):
+        return f"{bar(round(BAR_LEN * (i + 1) / len(STAGE_LABELS)))}\n{STAGE_LABELS[i]}..."
+
+    def action(self, kind="typing"):
+        self._try(self.bot.send_chat_action, self.chat_id, kind)
+
+    def start(self):
+        self.action("typing")
+        sent = self._try(self.bot.send_message, self.chat_id, self._text(0))
+        self.msg_id = getattr(sent, "message_id", None)
+        self._wait()
+
+    def step(self, i):
+        if self.msg_id is not None:
+            self._try(self.bot.edit_message_text, self._text(i), chat_id=self.chat_id, message_id=self.msg_id)
+        self._wait()
+
+    def finish(self):
+        if self.msg_id is not None:
+            self._try(self.bot.delete_message, self.chat_id, self.msg_id)
+            self.msg_id = None
+
+
+def send_document_file(bot, chat_id, path, visible_name, caption, private=False):
+    """Sends a saved file. In a private chat it tries a message effect first (🎉, then 🔥, then 👍).
+    If Telegram refuses the effect, the file is sent normally, with no note about it.
+    Used only for the final result of an option tap."""
+    def attempt(**extra):
+        with open(path, "rb") as f:
+            return bot.send_document(chat_id, f, visible_file_name=visible_name, caption=caption, **extra)
+
+    if private:
+        for effect in EFFECT_IDS:
+            try:
+                return attempt(message_effect_id=effect)
+            except ApiException:
+                continue
+    return attempt()
+
+
 class Implementer:
-    def __init__(self, bot, owner_id, data_dir):
+    def __init__(self, bot, owner_id, data_dir, pause=0.5):
         self.bot = bot
         self.owner = owner_id
         self.data_dir = data_dir
+        self.pause = pause  # seconds between animation steps (tests use 0)
         self.pending = {}  # chat_id -> (path of the saved original, display name)
         self.lock = threading.Lock()
 
@@ -400,7 +536,7 @@ class Implementer:
         return self.owner is not None and user_id == self.owner
 
     def refuse(self, chat_id):
-        self.bot.send_message(chat_id, "🔒 Ye bot private hai.")
+        self.bot.send_message(chat_id, f"🔒 {fx_bold('Ye bot private hai.')}")
 
     def user_dir(self, chat_id, sub):
         return os.path.join(self.data_dir, str(int(chat_id)), sub)
@@ -410,7 +546,7 @@ class Implementer:
         uid = message.from_user.id
         if self.owner is None:
             # Same as the pinger bot: shows the user's own id, so the owner can set OWNER_ID.
-            self.bot.send_message(chat_id, f"🆔 Aapka Telegram ID: {uid}\n\n"
+            self.bot.send_message(chat_id, f"🆔 {fx_bold('Aapka Telegram ID')}: {uid}\n\n"
                                   "Render me OWNER_ID naam ki env variable me ye ID daal, "
                                   "service restart karo, phir /start likho.")
             return
@@ -425,26 +561,32 @@ class Implementer:
         doc = message.document
         raw_name = doc.file_name or ""
         if not raw_name.lower().endswith(".py"):
-            return self.bot.send_message(chat_id, "⚠️ Sirf .py file bhejo. Dusri file ko main nahi chhedunga.")
+            return self.bot.send_message(chat_id, warn("Sirf .py file bhejo. Dusri file ko main nahi chhedunga."))
         if (doc.file_size or 0) > MAX_BYTES:
-            return self.bot.send_message(chat_id, "⚠️ Ye file bahut badi hai. Limit 300 KB hai.")
+            return self.bot.send_message(chat_id, warn("Ye file bahut badi hai. Limit 300 KB hai."))
+        prog = Progress(self.bot, chat_id, self.pause)
+        prog.start()
         try:
-            info = self.bot.get_file(doc.file_id)
-            data = self.bot.download_file(info.file_path)
-        except Exception:
-            return self.bot.send_message(chat_id, "⚠️ File download nahi ho payi. Dobara bhejo.")
-        if not isinstance(data, bytes) or len(data) > MAX_BYTES:
-            return self.bot.send_message(chat_id, "⚠️ File sahi se nahi aayi. Dobara bhejo.")
-        source, err = read_source(data)
-        if err:
-            return self.bot.send_message(chat_id, "⚠️ " + err)
-        name = safe_name(raw_name)
-        path = save_unique(self.user_dir(chat_id, "uploads"), name, data)
-        with self.lock:
-            self.pending[chat_id] = (path, name)
-        self.bot.send_message(chat_id, card(f"📄 File mil gayi: {name}", [status_block(source)],
-                                            "Ab neeche se option chuno."),
-                              reply_markup=option_keyboard())
+            try:
+                info = self.bot.get_file(doc.file_id)
+                data = self.bot.download_file(info.file_path)
+            except Exception:
+                return self.bot.send_message(chat_id, warn("File download nahi ho payi. Dobara bhejo."))
+            if not isinstance(data, bytes) or len(data) > MAX_BYTES:
+                return self.bot.send_message(chat_id, warn("File sahi se nahi aayi. Dobara bhejo."))
+            source, err = read_source(data)
+            if err:
+                return self.bot.send_message(chat_id, warn(err))
+            prog.step(1)
+            name = safe_name(raw_name)
+            path = save_unique(self.user_dir(chat_id, "uploads"), name, data)
+            with self.lock:
+                self.pending[chat_id] = (path, name)
+            self.bot.send_message(chat_id, card(f"📄 {fx_bold('File mil gayi')}: {name}", [status_block(source)],
+                                                "Ab neeche se option chuno."),
+                                  reply_markup=option_keyboard())
+        finally:
+            prog.finish()
 
     def on_status(self, message):
         chat_id = message.chat.id
@@ -459,11 +601,11 @@ class Implementer:
             with open(path, "rb") as f:
                 data = f.read()
         except OSError:
-            return self.bot.send_message(chat_id, "⚠️ Wo file ab nahi mil rahi. Dobara bhejo.")
+            return self.bot.send_message(chat_id, warn("Wo file ab nahi mil rahi. Dobara bhejo."))
         source, err = read_source(data)
         if err:
-            return self.bot.send_message(chat_id, "⚠️ " + err)
-        self.bot.send_message(chat_id, card(f"📊 Status: {name}", [status_block(source)],
+            return self.bot.send_message(chat_id, warn(err))
+        self.bot.send_message(chat_id, card(f"📊 {fx_bold('Status')}: {name}", [status_block(source)],
                                             "Neeche se option chuno, ya nayi .py file bhejo."),
                               reply_markup=option_keyboard())
 
@@ -477,13 +619,14 @@ class Implementer:
                                          "Pehle file bhejo aur option chuno.")
         with open(path, "rb") as f:
             self.bot.send_document(chat_id, f, visible_file_name=display_name(os.path.basename(path)),
-                                   caption=card("🔁 Pichli updated file", [], RESULT_NOTE))
+                                   caption=card(f"🔁 {fx_bold('Pichli updated file')}", [], RESULT_NOTE))
 
     def on_text(self, message):
         chat_id = message.chat.id
         if not self.is_owner(message.from_user.id):
             return self.refuse(chat_id)
-        text = (message.text or "").strip()
+        # Old labels (no emoji) map to the current ones, so both work.
+        text = canonical_label((message.text or "").strip())
         if text.startswith("/"):
             return  # commands are handled by their own handlers; unknown ones are ignored
         # The two info buttons go to the same handlers as the typed commands.
@@ -501,26 +644,35 @@ class Implementer:
         if pending is None:
             return self.bot.send_message(chat_id, "📭 Pehle apni bot ki .py file bhejo.")
         path, name = pending
+        private = message.chat.type == "private"
+        prog = Progress(self.bot, chat_id, self.pause)
+        prog.start()
         try:
-            with open(path, "rb") as f:
-                data = f.read()
-        except OSError:
-            return self.bot.send_message(chat_id, "⚠️ Wo file ab nahi mil rahi. Dobara bhejo.")
-        source, err = read_source(data)
-        if err:
-            return self.bot.send_message(chat_id, "⚠️ " + err)
-        try:
-            new_source, reply = plan(source, text)
-        except Exception:
-            return self.bot.send_message(chat_id, "⚠️ Kuch gadbad ho gayi, file nahi badli. "
-                                         "Dobara try karo.")
-        if new_source is None:
-            return self.bot.send_message(chat_id, f"ℹ️ File nahi badli.\n\n{reply}")
-        out_name = result_name(name)
-        out_path = save_unique(self.user_dir(chat_id, "results"), out_name, new_source.encode("utf-8"))
-        with open(out_path, "rb") as f:
-            self.bot.send_document(chat_id, f, visible_file_name=out_name,
-                                   caption=card(f"✅ Naya file taiyaar hai: {out_name}", [reply], RESULT_NOTE))
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+            except OSError:
+                return self.bot.send_message(chat_id, warn("Wo file ab nahi mil rahi. Dobara bhejo."))
+            source, err = read_source(data)
+            if err:
+                return self.bot.send_message(chat_id, warn(err))
+            prog.step(1)
+            try:
+                new_source, reply = plan(source, text)
+            except Exception:
+                return self.bot.send_message(chat_id, warn("Kuch gadbad ho gayi, file nahi badli. "
+                                                           "Dobara try karo."))
+            if new_source is None:
+                return self.bot.send_message(chat_id, f"ℹ️ {fx_bold('File nahi badli.')}\n\n{reply}")
+            prog.step(2)
+            out_name = result_name(name)
+            out_path = save_unique(self.user_dir(chat_id, "results"), out_name, new_source.encode("utf-8"))
+            prog.action("upload_document")
+            send_document_file(self.bot, chat_id, out_path, out_name,
+                               card(f"✅ {fx_bold('Naya file taiyaar hai')}: {out_name}", [reply], RESULT_NOTE),
+                               private)
+        finally:
+            prog.finish()
 
 
 def register_handlers(bot, impl):
