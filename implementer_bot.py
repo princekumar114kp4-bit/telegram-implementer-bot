@@ -118,6 +118,7 @@ WELCOME = (f"👋 {fx_bold('Namaste!')} Main Bot Implementer hoon.\n"
            f"{RULE}\n"
            "📎 Apni bot ki .py file bhejo.\n"
            "➕ Main web server aur/ya pinger add karke ek NAYI file bhejunga.\n"
+           "AI key set hone par purana web/pinger code hata ke naya daalta hai.\n"
            "🔒 Aapki original file main nahi chhedunga.\n\n"
            f"🧭 {fx_script('Options')}\n"
            "File bhejne ke baad neeche ke option chuno:\n"
@@ -1492,6 +1493,407 @@ def ai_inject_backup(source, admin_id, cfg, http=None, lib=None):
     return None, f"AI ne {AI_TRIES} koshish ke baad bhi sahi code nahi diya (aakhri wajah: {reason})."
 
 
+# ---- Replacing old web server / pinger code (only when an AI key is set) ---------------------
+# The AI never writes code here. It only names line ranges of old code. The code checks every range
+# against the file's own syntax tree, deletes only those statements (and code that depends on them),
+# checks the result, and then the normal injection adds the new block.
+
+REMOVE_FORBID = re.compile(
+    r"infinity_polling|run_polling|start_polling|\.idle\s*\(|asyncio\.run|\bTeleBot\s*\(|Application\.builder"
+    r"|\bUpdater\s*\(|add_handler|message_handler|callback_query_handler|CommandHandler|MessageHandler"
+    r"|__name__\s*==|hyv-injected:backup|_hyv_bk_|_HYV_BK_")
+REMOVE_MAX_PICKS = 200
+AI_REMOVE_SYSTEM = ("You find old web server and keep-alive pinger code in one Python Telegram bot file. "
+                    "You do not write or change code. Reply only with a JSON object such as "
+                    '{"remove": [[12, 14], [30, 30]]}, listing the start and end line (both included) of each '
+                    "statement to delete. Pick only from the candidate list you are given.")
+DEF_KINDS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+class RemovalError(Exception):
+    """A safe Hinglish reason why an AI removal plan was refused."""
+
+
+def _span(node):
+    start = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+    return start, node.end_lineno
+
+
+def _stmts(tree):
+    return [n for n in ast.walk(tree) if isinstance(n, ast.stmt)]
+
+
+def _parents(tree):
+    return {c: p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
+
+
+def _bound(node):
+    """Names a single statement binds itself (not names bound inside its child statements)."""
+    out = set()
+    if isinstance(node, DEF_KINDS):
+        out.add(node.name)
+    elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for t in targets:
+            out |= {x.id for x in ast.walk(t) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store)}
+    elif isinstance(node, (ast.Import, ast.ImportFrom)):
+        for a in node.names:
+            out.add(a.asname or a.name.split(".")[0])
+    return out
+
+
+def _own_names(node):
+    """Names a statement loads in its own expressions (decorators, tests, values), not in child statements."""
+    names, stack = set(), list(ast.iter_child_nodes(node))
+    while stack:
+        c = stack.pop()
+        if isinstance(c, ast.stmt):
+            continue
+        if isinstance(c, ast.Name) and isinstance(c.ctx, ast.Load):
+            names.add(c.id)
+        stack.extend(ast.iter_child_nodes(c))
+    return names
+
+
+def _marker_ranges(lines, kind):
+    out, start = [], None
+    for i, line in enumerate(lines, 1):
+        if f"# >>> hyv-injected:{kind}" in line:
+            start = i
+        elif f"# <<< hyv-injected:{kind}" in line and start is not None:
+            out.append((start, i))
+            start = None
+    return out
+
+
+def _base_match(node, kind, head, text, markers, source):
+    """Is this statement plainly part of the old web server or pinger? head is the text a def is judged
+    by (its decorators and header), text is the whole statement. Sure patterns only, plus a thread
+    target that sleeps and makes web requests."""
+    s, e = _span(node)
+    if any(a <= s and e <= b for a, b in markers):
+        return True
+    if kind == "web":
+        return _any(WEB_SURE, head, re.M)
+    if _any(PINGER_SURE, head, re.I | re.M):
+        return True
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return (bool(re.search(rf"target\s*=\s*{node.name}\b", source))
+                and bool(re.search(PERIODIC_SLEEP, text)) and bool(re.search(PERIODIC_HTTP, text)))
+    return False
+
+
+def _related(tree, lines, kinds):
+    """Statements that belong to the chosen kinds: the plain matches, plus every statement that
+    depends on a name those matches bind (for example the thread start that calls run_web)."""
+    source = "\n".join(lines)
+    stmts = _stmts(tree)
+    segs = {n: "\n".join(lines[_span(n)[0] - 1:_span(n)[1]]) for n in stmts}
+    heads = {}
+    for n in stmts:
+        heads[n] = segs[n]
+        if isinstance(n, DEF_KINDS) and n.body and n.body[0].lineno > n.lineno:
+            heads[n] = "\n".join(lines[_span(n)[0] - 1:n.body[0].lineno - 1])
+    forbidden = {n for n in stmts if REMOVE_FORBID.search(segs[n])}
+    # docstrings and other bare strings are text, never code to delete
+    forbidden |= {n for n in stmts if isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
+                  and isinstance(n.value.value, str)}
+    parents = _parents(tree)
+    rel = set()
+    for kind in kinds:
+        markers = _marker_ranges(lines, kind)
+        cur = {n for n in stmts if n not in forbidden
+               and _base_match(n, kind, heads[n], segs[n], markers, source)}
+        changed = True
+        while changed:
+            changed = False
+            names = set()
+            for n in cur:
+                names |= _bound(n)
+            for n in stmts:
+                if n in cur or n in forbidden:
+                    continue
+                by_name = bool(_own_names(n) & names)
+                # a def is a unit when all of its body is related (a thread target, for example)
+                by_body = isinstance(n, DEF_KINDS) and bool(n.body) and all(b in cur for b in n.body)
+                # the sleep line of a pinger loop belongs to the pinger
+                by_sleep = (kind == "pinger" and parents.get(n) in cur
+                            and not any(hasattr(n, a) for a in ("body", "handlers", "orelse", "finalbody"))
+                            and bool(re.search(PERIODIC_SLEEP, segs[n])))
+                if by_name or by_body or by_sleep:
+                    cur.add(n)
+                    changed = True
+        rel |= cur
+    return rel
+
+
+def _candidate_lines(source, kinds):
+    """(start, end, first line) for every statement the AI may pick for these kinds."""
+    lines = source.splitlines()
+    tree = ast.parse(source)
+    rel = _related(tree, lines, kinds)
+    return [(*_span(n), lines[_span(n)[0] - 1].strip()[:80]) for n in _stmts(tree) if n in rel]
+
+
+def _label(node):
+    if isinstance(node, DEF_KINDS):
+        return ("class " if isinstance(node, ast.ClassDef) else "function ") + node.name
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return "import line"
+    if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        names = sorted(_bound(node))
+        return ("setting " + ", ".join(names[:2])) if names else "setting line"
+    return "code line"
+
+
+def _remove_code(source, picks, kinds):
+    """Deletes the picked statements (and what depends on them). Returns (new_source, removed) where
+    removed is a list of (start, end, label). Raises RemovalError when anything is unsafe."""
+    lines = source.splitlines(keepends=True)
+    plain = [ln.rstrip("\r\n") for ln in lines]
+    tree = ast.parse(source)
+    rel = _related(tree, plain, kinds)
+    stmts = _stmts(tree)
+    parents = _parents(tree)
+    spans = {n: _span(n) for n in stmts}
+    by_span = {}
+    for n in stmts:
+        if n in rel:
+            by_span.setdefault(spans[n], n)
+
+    def gone(n):
+        while n is not None:
+            if n in removed:
+                return True
+            n = parents.get(n)
+        return False
+
+    if not picks:
+        raise RemovalError("AI ne koi purana code nahi pehchana.")
+    removed = set()
+    for pick in picks[:REMOVE_MAX_PICKS]:
+        if pick not in by_span:
+            raise RemovalError(f"Line {pick[0]}-{pick[1]} purana web server ya pinger code nahi hai. Sahi lines chuno.")
+        removed.add(by_span[pick])
+
+    markers = {k: _marker_ranges(plain, k) for k in kinds}
+    changed = True
+    while changed:
+        changed = False
+        names = set()
+        for n in removed:
+            names |= _bound(n)
+        for n in stmts:                       # dependants of removed names
+            if gone(n) or not (_own_names(n) & names):
+                continue
+            if n not in rel:
+                raise RemovalError(f"Line {spans[n][0]} ka code hataye gaye code par depend karta hai, "
+                                   "aur wo web server ya pinger ka code nahi hai.")
+            removed.add(n)
+            changed = True
+            break
+        if changed:
+            continue
+        for k in kinds:                       # a marker block goes as a whole
+            for a, b in markers[k]:
+                top = [n for n in stmts if parents.get(n) is tree and a <= spans[n][0] and spans[n][1] <= b]
+                if any(gone(n) for n in top):
+                    for n in top:
+                        if n not in removed:
+                            removed.add(n)
+                            changed = True
+
+    for n in removed:                         # overbroad: nothing unrelated inside a removed if/while/with/try
+        if isinstance(n, DEF_KINDS):
+            continue                          # a def is one unit: its body is part of it
+        for d in ast.walk(n):
+            if d is not n and isinstance(d, ast.stmt) and d not in rel:
+                raise RemovalError(f"Lines {spans[n][0]}-{spans[n][1]} me purana code ke saath aur code bhi hai. "
+                                   "Chhote hisse chuno.")
+
+    top = [n for n in stmts if n in removed and not gone(parents.get(n))]
+    for n in top:
+        s, e = spans[n]
+        p = parents.get(n)
+        indent = re.match(r"[ \t]*", plain[s - 1]).group(0)
+        if len(indent) != n.col_offset:
+            raise RemovalError(f"Line {s} par ek se zyada code hai, isliye ise safely nahi hata sakta.")
+        if p is not None and not isinstance(p, ast.Module) and p.lineno == s:
+            raise RemovalError(f"Line {s} par ek hi line me block hai, isliye ise safely nahi hata sakta.")
+        anc = set()
+        q = p
+        while q is not None:
+            anc.add(q)
+            q = parents.get(q)
+        for m in stmts:
+            if m in removed or m in anc or gone(m) or m is n:
+                continue
+            if not (spans[m][1] < s or spans[m][0] > e):
+                raise RemovalError(f"Line {s} ka code kisi aur code ke saath ek hi line par hai. Ise safely nahi hata sakta.")
+
+    drop, repl = set(), {}
+    for n in top:
+        s, e = spans[n]
+        drop.update(range(s, e + 1))
+    for k in kinds:
+        for a, b in markers[k]:
+            if any(parents.get(n) is tree and a <= spans[n][0] and spans[n][1] <= b and n in removed for n in stmts):
+                drop.update(range(a, b + 1))
+    for p in ast.walk(tree):
+        body = getattr(p, "body", None)
+        if isinstance(p, ast.Module) or not isinstance(body, list) or not body or gone(p) or p in removed:
+            continue
+        if all(b in removed for b in body):
+            s = spans[body[0]][0]
+            repl[s] = re.match(r"[ \t]*", plain[s - 1]).group(0) + "pass"
+
+    out = []
+    for i, line in enumerate(lines, 1):
+        if i in repl:
+            out.append(repl[i] + "\n")
+        elif i not in drop:
+            out.append(line)
+    new_source = "".join(out)
+
+    try:
+        new_tree = ast.parse(new_source)
+        compile(new_source, "<bot>", "exec")
+    except (SyntaxError, ValueError):
+        raise RemovalError("Purana code hatane ke baad file compile nahi hoti.")
+    removed_defs = {n.name for n in removed if isinstance(n, DEF_KINDS)}
+    orig_top = {n.name for n in tree.body if isinstance(n, DEF_KINDS)}
+    new_top = {n.name for n in new_tree.body if isinstance(n, DEF_KINDS)}
+    if not (orig_top - removed_defs) <= new_top:
+        raise RemovalError("Bot ka koi kaam ka function ya class bhi hat gaya.")
+    if len(REMOVE_FORBID.findall(new_source)) != len(REMOVE_FORBID.findall(source)):
+        raise RemovalError("Bot ka polling ya main code badal gaya.")
+    loads, kept_bound, removed_names = set(), set(), set()
+    for n in _stmts(new_tree):
+        loads |= _own_names(n)
+        kept_bound |= _bound(n)
+    for n in removed:
+        removed_names |= _bound(n)
+    if (removed_names - kept_bound) & loads:
+        raise RemovalError("Hataye gaye code ka koi hissa baaki code me use ho raha hai.")
+    info = sorted((spans[n][0], spans[n][1], _label(n)) for n in top)
+    return new_source, info
+
+
+def _parse_picks(reply):
+    m = re.search(r"\{.*\}", reply or "", re.S)
+    if not m:
+        raise RemovalError("AI ka jawab samajh nahi aaya.")
+    try:
+        data = json.loads(m.group(0))
+    except ValueError:
+        raise RemovalError("AI ka jawab samajh nahi aaya.")
+    picks = data.get("remove") if isinstance(data, dict) else None
+    if not isinstance(picks, list):
+        raise RemovalError("AI ne lines ki list nahi di.")
+    out = []
+    for p in picks:
+        if isinstance(p, list) and len(p) == 2 and all(isinstance(x, int) and not isinstance(x, bool) for x in p):
+            out.append((p[0], p[1]))
+        else:
+            raise RemovalError("AI ne line numbers sahi format me nahi diye.")
+    return out
+
+
+def _remove_prompt(source, kinds, cands, reason=None):
+    what = " and ".join("web server" if k == "web" else "pinger" for k in kinds)
+    text = (f"Task: the owner wants a new {what} added to this bot. Pick the OLD {what} code to delete.\n"
+            "- Pick only from the candidate list. Use the start and end line exactly as listed.\n"
+            "- Never pick the bot's handlers, the polling or run call, the main entry, the bot object, or unrelated code.\n"
+            "- Pick the statements that exist only for the old web server or pinger (imports, the app object, routes, "
+            "the thread start, the function itself).\n"
+            'Reply only with JSON: {"remove": [[start, end], ...]}\n\n'
+            "Candidates:\n" + "\n".join(f"- lines {s}-{e}: {first}" for s, e, first in cands))
+    text += "\n\nThe bot file:\n```python\n" + source + "\n```"
+    if reason:
+        text += f"\n\nYour previous answer was rejected because: {reason} Fix it and send the JSON again."
+    return text
+
+
+def ai_remove_old(source, kinds, cfg, http=None):
+    """Asks the AI which old code to delete, checks the answer, and applies it. Up to AI_TRIES tries.
+    Returns (new_source, removed, None) or (None, None, reason). Never raises."""
+    if len(source.encode("utf-8")) > AI_SRC_MAX:
+        return None, None, "Ye file AI ke liye bahut badi hai (limit 30 KB)."
+    http = http if http is not None else requests
+    cands = _candidate_lines(source, kinds)
+    reason = None
+    for _ in range(AI_TRIES):
+        try:
+            reply = ai_request(cfg, AI_REMOVE_SYSTEM, _remove_prompt(source, kinds, cands, reason), http,
+                               max_tokens=2048)
+        except AIError as e:
+            if not e.retry:
+                return None, None, f"AI se kaam nahi ho paya: {e}"
+            reason = str(e)
+            continue
+        try:
+            new_source, removed = _remove_code(source, _parse_picks(reply), kinds)
+            return new_source, removed, None
+        except RemovalError as e:
+            reason = str(e)
+    return None, None, reason
+
+
+def _replace_targets(source, web, pin, want_web, want_pin):
+    """Kinds whose old code must be removed first: the option wants it, it is there, and we can
+    point at it. Empty list means the old path (add only, or skip) applies."""
+    targets = []
+    for kind, want, status in (("web", want_web, web), ("pinger", want_pin, pin)):
+        if want and status != "none" and _candidate_lines(source, [kind]):
+            targets.append(kind)
+    return targets
+
+
+def _marker_lines(text, kind):
+    lines = text.splitlines()
+    start = next(i for i, ln in enumerate(lines, 1) if f"# >>> hyv-injected:{kind}" in ln)
+    end = next(i for i, ln in enumerate(lines, 1) if f"# <<< hyv-injected:{kind}" in ln)
+    return start, end
+
+
+def plan_replace(source, choice, targets, web, pin, ai_cfg, http=None):
+    """The AI-key path: remove the old code of the chosen kinds, then add the new blocks.
+    Returns (new_source, reply_text), or (None, reason) and the original file stays as it is."""
+    want_web = choice in (BTN_WEB, BTN_BOTH)
+    want_pin = choice in (BTN_PINGER, BTN_BOTH)
+    add_web = want_web and (web == "none" or "web" in targets)
+    add_pin = want_pin and (pin == "none" or "pinger" in targets)
+    new_source, removed, err = ai_remove_old(source, targets, ai_cfg, http)
+    if new_source is None:
+        return None, (f"AI purana code sahi pehchan nahi paya ({err}). Isliye kuch nahi badla. "
+                      "File waisi hi rahegi.")
+    try:
+        out = inject(new_source, add_web, add_pin)
+    except (ValueError, SyntaxError):
+        return None, "Naya code jodne ki jaanch fail hui. Isliye kuch nahi badla. File waisi hi rahegi."
+    for kind in ("web", "pinger"):
+        if out.count(f"# >>> hyv-injected:{kind}") > 1 or out.count(f"# <<< hyv-injected:{kind}") > 1:
+            return None, "Naya code do baar lag raha tha. Isliye kuch nahi badla. File waisi hi rahegi."
+
+    text = ["Purana code hata kar naya daal diya."]
+    if removed:
+        text.append("Ye purana code hataya:")
+        for s, e, label in removed:
+            text.append(f"- line {s}" if s == e else f"- line {s}-{e}: {label}")
+    text.append("Ye naya code jodha:")
+    if add_web:
+        s, e = _marker_lines(out, "web")
+        text.append(f"- Web server: line {s}-{e}")
+    if add_pin:
+        s, e = _marker_lines(out, "pinger")
+        text.append(f"- Pinger: line {s}-{e} (default 5 minute)")
+        if web_server_status(out) == "none":
+            text.append("Pinger tabhi kaam karega jab bot par web server bhi chale.")
+    text.append("Dhyan se check karna. Ye badlaav AI ne kiya hai, aur file ka code aapke chune hue AI provider "
+                "ko bheja gaya tha. Render par deploy karne se pehle ek baar test karna.")
+    return out, "\n".join(text)
+
+
 def plan(source, choice, admin_id=None, ai_cfg=None, http=None):
     """Returns (new_source, reply_text). new_source is None when nothing needs adding."""
     if choice == BTN_DB:
@@ -1500,6 +1902,10 @@ def plan(source, choice, admin_id=None, ai_cfg=None, http=None):
     pin = pinger_status(source)
     want_web = choice in (BTN_WEB, BTN_BOTH)
     want_pin = choice in (BTN_PINGER, BTN_BOTH)
+    if ai_cfg is not None and (want_web or want_pin):
+        targets = _replace_targets(source, web, pin, want_web, want_pin)
+        if targets:
+            return plan_replace(source, choice, targets, web, pin, ai_cfg, http)
     add_web = want_web and web == "none"
     add_pin = want_pin and pin == "none"
     skipped = []
